@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  tools/run-qwen35 [serve] [--host HOST] [--port PORT] [--repo DIR] [--agent-optimized|--no-agent-optimized] [--max-total-tokens N] [--default-new-tokens N] [--max-new-tokens N] [--prefix-cache-tokens N] [--prefill-chunk-tokens N] [--prefill-chunk-group N] [--max-active-connections N] [--socket-timeout-s N] [--prewarm-prompt-file FILE] [--prewarm-request-file FILE] [--no-auto-prewarm] [--prefix-state-file FILE] [--no-prefix-state] [--dry-run]
+
+Defaults:
+  mode:              serve
+  serve mode:        agent-optimized
+  serve total tokens: 65536
+  serve default out: 512
+  serve max output:  4096
+  prefix cache:      24576 prompt tokens
+  prefill chunk:     1600 prompt tokens
+  prefill group:     10 chunks
+  socket timeout:    30 seconds
+  prewarm:           auto from $PEREGRINE_PI_PREWARM_REQUEST or /tmp/pi-peregrine-request.json
+  prefix state:      persisted to ~/.cache/peregrine/ after startup prewarm and
+                     reloaded on the next start (disable with --no-prefix-state)
+  repo:              $PEREGRINE_QWEN35_REPO, newest HF cache snapshot, or /tmp/qwen3.5-9b-q4
+  build:             zig build -Doptimize=ReleaseFast
+EOF
+}
+
+die() {
+  printf 'peregrine: %s\n' "$*" >&2
+  exit 2
+}
+
+repo_root() {
+  local script_dir
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  cd -- "$script_dir/.." && pwd
+}
+
+mtime() {
+  stat -f '%m' "$1" 2>/dev/null || stat -c '%Y' "$1"
+}
+
+find_repo() {
+  if [[ -n "${PEREGRINE_QWEN35_REPO:-}" ]]; then
+    [[ -d "$PEREGRINE_QWEN35_REPO" ]] || die "PEREGRINE_QWEN35_REPO does not exist: $PEREGRINE_QWEN35_REPO"
+    printf '%s\n' "$PEREGRINE_QWEN35_REPO"
+    return
+  fi
+
+  local cache_dir="$HOME/.cache/huggingface/hub/models--mlx-community--Qwen3.5-9B-4bit/snapshots"
+  local best=""
+  local best_mtime=0
+  if [[ -d "$cache_dir" ]]; then
+    local snapshot
+    for snapshot in "$cache_dir"/*; do
+      [[ -d "$snapshot" ]] || continue
+      local ts
+      ts="$(mtime "$snapshot")"
+      if (( ts > best_mtime )); then
+        best_mtime="$ts"
+        best="$snapshot"
+      fi
+    done
+  fi
+  if [[ -n "$best" ]]; then
+    printf '%s\n' "$best"
+    return
+  fi
+
+  if [[ -d /tmp/qwen3.5-9b-q4 ]]; then
+    printf '%s\n' /tmp/qwen3.5-9b-q4
+    return
+  fi
+
+  die "could not find mlx-community/Qwen3.5-9B-4bit; set PEREGRINE_QWEN35_REPO or pass --repo"
+}
+
+build_release() {
+  local root="$1"
+  printf 'peregrine: building ReleaseFast...\n' >&2
+  (cd -- "$root" && zig build -Doptimize=ReleaseFast)
+}
+
+print_dry_run() {
+  printf 'peregrine: dry-run command:'
+  printf ' %q' "$@"
+  printf '\n'
+}
+
+main() {
+  local root
+  root="$(repo_root)"
+
+  if [[ $# -gt 0 && "$1" == "serve" ]]; then
+    shift
+  fi
+
+  local repo=""
+  local max_new_tokens=""
+  local default_new_tokens=""
+  local max_total_tokens=""
+  local prefix_cache_tokens=""
+  local prefill_chunk_tokens=""
+  local prefill_chunk_group=""
+  local host="127.0.0.1"
+  local port="8080"
+  local agent_optimized="1"
+  local max_active_connections=""
+  local socket_timeout_seconds=""
+  local prewarm_prompt_file=""
+  local prewarm_request_file=""
+  local auto_prewarm="1"
+  local prefix_state_file=""
+  local prefix_state="1"
+  local dry_run="0"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)
+        [[ $# -ge 2 ]] || die "--repo requires a value"
+        repo="$2"
+        shift 2
+        ;;
+      --max-new-tokens)
+        [[ $# -ge 2 ]] || die "--max-new-tokens requires a value"
+        max_new_tokens="$2"
+        shift 2
+        ;;
+      --default-new-tokens)
+        [[ $# -ge 2 ]] || die "--default-new-tokens requires a value"
+        default_new_tokens="$2"
+        shift 2
+        ;;
+      --max-total-tokens)
+        [[ $# -ge 2 ]] || die "--max-total-tokens requires a value"
+        max_total_tokens="$2"
+        shift 2
+        ;;
+      --prefix-cache-tokens)
+        [[ $# -ge 2 ]] || die "--prefix-cache-tokens requires a value"
+        prefix_cache_tokens="$2"
+        shift 2
+        ;;
+      --prefill-chunk-tokens)
+        [[ $# -ge 2 ]] || die "--prefill-chunk-tokens requires a value"
+        prefill_chunk_tokens="$2"
+        shift 2
+        ;;
+      --prefill-chunk-group)
+        [[ $# -ge 2 ]] || die "--prefill-chunk-group requires a value"
+        prefill_chunk_group="$2"
+        shift 2
+        ;;
+      --agent-optimized)
+        agent_optimized="1"
+        shift
+        ;;
+      --no-agent-optimized)
+        agent_optimized="0"
+        shift
+        ;;
+      --host)
+        [[ $# -ge 2 ]] || die "--host requires a value"
+        host="$2"
+        shift 2
+        ;;
+      --port)
+        [[ $# -ge 2 ]] || die "--port requires a value"
+        port="$2"
+        shift 2
+        ;;
+      --max-active-connections)
+        [[ $# -ge 2 ]] || die "--max-active-connections requires a value"
+        max_active_connections="$2"
+        shift 2
+        ;;
+      --socket-timeout-s)
+        [[ $# -ge 2 ]] || die "--socket-timeout-s requires a value"
+        socket_timeout_seconds="$2"
+        shift 2
+        ;;
+      --prewarm-prompt-file)
+        [[ $# -ge 2 ]] || die "--prewarm-prompt-file requires a value"
+        prewarm_prompt_file="$2"
+        shift 2
+        ;;
+      --prewarm-request-file)
+        [[ $# -ge 2 ]] || die "--prewarm-request-file requires a value"
+        prewarm_request_file="$2"
+        shift 2
+        ;;
+      --no-auto-prewarm)
+        auto_prewarm="0"
+        shift
+        ;;
+      --prefix-state-file)
+        [[ $# -ge 2 ]] || die "--prefix-state-file requires a value"
+        prefix_state_file="$2"
+        shift 2
+        ;;
+      --no-prefix-state)
+        prefix_state="0"
+        shift
+        ;;
+      --dry-run)
+        dry_run="1"
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        usage
+        die "unknown argument: $1"
+        ;;
+    esac
+  done
+
+  if [[ -z "$repo" ]]; then
+    repo="$(find_repo)"
+  fi
+  [[ -d "$repo" ]] || die "checkpoint directory does not exist: $repo"
+
+  if [[ "$auto_prewarm" == "1" && -z "$prewarm_prompt_file" && -z "$prewarm_request_file" ]]; then
+    if [[ -n "${PEREGRINE_PI_PREWARM_REQUEST:-}" ]]; then
+      [[ -f "$PEREGRINE_PI_PREWARM_REQUEST" ]] || die "PEREGRINE_PI_PREWARM_REQUEST does not exist: $PEREGRINE_PI_PREWARM_REQUEST"
+      prewarm_request_file="$PEREGRINE_PI_PREWARM_REQUEST"
+    elif [[ -f /tmp/pi-peregrine-request.json ]]; then
+      prewarm_request_file="/tmp/pi-peregrine-request.json"
+    fi
+    if [[ -n "$prewarm_request_file" ]]; then
+      printf 'peregrine: auto-prewarming from %s\n' "$prewarm_request_file" >&2
+    fi
+  fi
+
+  local args=(serve "$repo" --host "$host" --port "$port")
+  if [[ "$agent_optimized" == "1" ]]; then
+    args+=(--agent-optimized)
+  fi
+  if [[ -n "$max_total_tokens" ]]; then
+    args+=(--max-total-tokens "$max_total_tokens")
+  fi
+  if [[ -n "$default_new_tokens" ]]; then
+    args+=(--default-new-tokens "$default_new_tokens")
+  fi
+  if [[ -n "$max_new_tokens" ]]; then
+    args+=(--max-new-tokens "$max_new_tokens")
+  fi
+  if [[ -n "$prefix_cache_tokens" ]]; then
+    args+=(--prefix-cache-tokens "$prefix_cache_tokens")
+  fi
+  if [[ -n "$prefill_chunk_tokens" ]]; then
+    args+=(--prefill-chunk-tokens "$prefill_chunk_tokens")
+  fi
+  if [[ -n "$prefill_chunk_group" ]]; then
+    args+=(--prefill-chunk-group "$prefill_chunk_group")
+  fi
+  if [[ -n "$max_active_connections" ]]; then
+    args+=(--max-active-connections "$max_active_connections")
+  fi
+  if [[ -n "$socket_timeout_seconds" ]]; then
+    args+=(--socket-timeout-s "$socket_timeout_seconds")
+  fi
+  if [[ -n "$prewarm_prompt_file" ]]; then
+    args+=(--prewarm-prompt-file "$prewarm_prompt_file")
+  fi
+  if [[ -n "$prewarm_request_file" ]]; then
+    args+=(--prewarm-request-file "$prewarm_request_file")
+  fi
+  if [[ -n "$prefix_state_file" ]]; then
+    args+=(--prefix-state-file "$prefix_state_file")
+  fi
+  if [[ "$prefix_state" == "0" ]]; then
+    args+=(--no-prefix-state)
+  fi
+  if [[ "$dry_run" == "1" ]]; then
+    print_dry_run "$root/zig-out/bin/peregrine" "${args[@]}"
+    exit 0
+  fi
+  build_release "$root"
+  exec "$root/zig-out/bin/peregrine" "${args[@]}"
+}
+
+main "$@"
