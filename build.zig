@@ -86,17 +86,9 @@ pub fn build(b: *std.Build) void {
 
     // `zig build script-check`
     const shell_check = b.addSystemCommand(&.{ "bash", "-n" });
-    shell_check.addFileArg(b.path("tools/run-qwen35"));
-    const python_check = b.addSystemCommand(&.{ "python3", "-m", "py_compile" });
-    const python_scripts = [_][]const u8{
-        "tools/gdn_chunk_scan_probe.py",
-    };
-    for (python_scripts) |script| {
-        python_check.addFileArg(b.path(script));
-    }
+    shell_check.addFileArg(b.path("scripts/run-qwen35"));
     const script_check_step = b.step("script-check", "Syntax-check shell and Python helper scripts");
     script_check_step.dependOn(&shell_check.step);
-    script_check_step.dependOn(&python_check.step);
 
     // `zig build ci` = fmt-check + tests + compile + script checks + metallib
     const ci_step = b.step("ci", "fmt-check, test, compile, script-check, and build metallib");

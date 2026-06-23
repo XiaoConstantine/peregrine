@@ -9,9 +9,11 @@ const Io = std.Io;
 const net = std.Io.net;
 const http = std.http;
 const metal = @import("runtime/metal.zig");
+const runtime_time = @import("runtime/time.zig");
 const config = @import("model/config.zig");
 const safetensors = @import("model/safetensors.zig");
 const model_mod = @import("model/model.zig");
+const mtp_mod = @import("model/mtp.zig");
 const prefill_mod = @import("model/prefill.zig");
 const generation_limits = @import("server/generation_limits.zig");
 const api_error = @import("api/error.zig");
@@ -27,6 +29,8 @@ const DeviceModel = model_mod.DeviceModel;
 const ModelState = model_mod.ModelState;
 const Tokenizer = @import("model/tokenizer.zig").Tokenizer;
 const Completion = api_response.Completion;
+const monotonicNowNs = runtime_time.monotonicNowNs;
+const msFromNs = runtime_time.msFromNs;
 const log = std.log.scoped(.peregrine_serve);
 pub const Options = struct {
     max_total_tokens: usize = 8192,
@@ -46,6 +50,8 @@ pub const Options = struct {
     /// Override for the persisted prefix-state file; null uses
     /// `$HOME/.cache/peregrine/` with the one-model default file name.
     prefix_state_file: ?[]const u8 = null,
+    /// Experimental Qwen3.5 MTP sidecar directory. Disabled by default.
+    mtp_dir: ?[]const u8 = null,
 
     pub fn validate(self: Options) !void {
         if (self.max_total_tokens == 0 or
@@ -100,6 +106,7 @@ const Context = struct {
     device: *metal.Device,
     queue: *metal.Queue,
     model: *DeviceModel,
+    mtp: ?*mtp_mod.Drafter,
     tok: *const Tokenizer,
     max_total: usize, // prompt + completion ceiling (KV capacity)
     default_new: u32, // request default when JSON omits output-token fields
@@ -130,6 +137,21 @@ pub fn run(gpa: std.mem.Allocator, io: Io, model_dir: []const u8, host: []const 
         model.deinit();
         gpa.destroy(model);
     }
+    var mtp: ?*mtp_mod.Drafter = null;
+    if (options.mtp_dir) |mtp_dir| {
+        try mtp_mod.verifyFingerprint(gpa, io, mtp_dir);
+        log.info("loading MTP sidecar {s}", .{mtp_dir});
+        var mtp_repo = try safetensors.Repository.open(gpa, io, mtp_dir);
+        defer mtp_repo.deinit();
+        const drafter = try gpa.create(mtp_mod.Drafter);
+        errdefer gpa.destroy(drafter);
+        drafter.* = try mtp_mod.Drafter.upload(&device, &queue, model.library, &mtp_repo);
+        mtp = drafter;
+    }
+    defer if (mtp) |drafter| {
+        drafter.deinit();
+        gpa.destroy(drafter);
+    };
     var tok = try Tokenizer.load(gpa, io, model_dir);
     defer tok.deinit();
 
@@ -139,6 +161,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, model_dir: []const u8, host: []const 
         .device = &device,
         .queue = &queue,
         .model = model,
+        .mtp = mtp,
         .tok = &tok,
         .max_total = options.max_total_tokens,
         .default_new = options.default_new_tokens,
@@ -151,6 +174,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, model_dir: []const u8, host: []const 
         .trace_prefill = std.c.getenv("PEREGRINE_TRACE_PREFILL") != null,
     };
     defer ctx.prefix_cache.deinit(ctx.request_gpa);
+    if (mtp != null) ctx.prefix_cache.enableHiddenTracking();
 
     var default_prefix_state_path: ?[]u8 = null;
     defer if (default_prefix_state_path) |p| ctx.request_gpa.free(p);
@@ -685,8 +709,9 @@ fn generateWithStaticPrefixCache(
     ctx.decode_lock.lockUncancelable(ctx.io);
     defer ctx.decode_lock.unlock(ctx.io);
 
+    const request_start_ns = if (ctx.trace_prefill) monotonicNowNs() else 0;
     const cache_store_limit = try prewarmStaticPromptTokenPrefixLocked(ctx, prompt_ids, static_prefix_prompt, callback);
-    return generateWithPrefixCacheLocked(ctx, prompt_ids, out, callback, cache_store_limit, stop_token_sequences);
+    return generateWithPrefixCacheLocked(ctx, prompt_ids, out, callback, cache_store_limit, stop_token_sequences, request_start_ns);
 }
 
 const PrefixReuse = struct {
@@ -707,10 +732,14 @@ fn generateWithPrefixCacheLocked(
     callback: ?DeviceModel.GeneratedTokenCallback,
     cache_store_limit: ?usize,
     stop_token_sequences: []const []const u32,
+    request_start_ns: u64,
 ) !usize {
     if (prompt_ids.len == 0 or out.len == 0) return error.EmptyInput;
     _ = try generation_limits.effectiveMaxNewTokens(prompt_ids.len, @intCast(out.len), ctx.max_total);
     const requested = std.math.add(usize, prompt_ids.len, out.len) catch return error.SequenceTooLong;
+    const trace_start_ns = if (ctx.trace_prefill and request_start_ns != 0) request_start_ns else if (ctx.trace_prefill) monotonicNowNs() else 0;
+    var decode_metrics = decode_loop.Metrics{ .request_start_ns = trace_start_ns };
+    const metrics_ptr: ?*decode_loop.Metrics = if (ctx.trace_prefill) &decode_metrics else null;
 
     const prefix_reuse = try resolveReusablePrefix(ctx, prompt_ids, callback, cache_store_limit);
     const local_capacity = requested - prefix_reuse.reuse_len;
@@ -737,6 +766,15 @@ fn generateWithPrefixCacheLocked(
         try reportPrefillProgress(callback, prefix_reuse.reuse_len, prompt_ids.len);
     }
 
+    // When MTP is loaded, capture the target's normalized prompt hidden states
+    // during prefill so the drafter can be seeded without a full prompt replay.
+    const prompt_len_u32 = std.math.cast(u32, prompt_ids.len) orelse return error.SequenceTooLong;
+    var mtp_prompt_hidden: ?metal.Buffer = if (ctx.mtp != null)
+        try ctx.device.createSharedBuffer(try hiddenRowsBytes(prompt_len_u32))
+    else
+        null;
+    defer if (mtp_prompt_hidden) |*buf| buf.destroy();
+
     const initial_next_token = try initialNextTokenFromPrefix(
         ctx,
         prompt_ids,
@@ -747,8 +785,80 @@ fn generateWithPrefixCacheLocked(
         callback,
         effective_cache_store_limit,
         false,
+        mtp_prompt_hidden,
     );
-    return decode_loop.decodeFromPrefixCache(.{
+    const prefill_done_ns = if (ctx.trace_prefill) monotonicNowNs() else 0;
+    const decode_prefix = ctx.prefix_cache.prefixState(initial_next_token.prefix_match);
+    if (ctx.mtp) |drafter| mtp_decode: {
+        var mtp_state = try mtp_mod.State.initBf16(ctx.device, requested);
+        defer mtp_state.deinit();
+
+        // Seed the drafter from the captured prompt hiddens. When prefill was
+        // skipped because the full prompt was already cached with a valid next
+        // token, copy the cached hidden rows into the prompt-hidden buffer
+        // first; otherwise prefill already populated it.
+        const mtp_ready = try seedMtpDrafter(
+            ctx,
+            drafter,
+            prompt_ids,
+            mtp_prompt_hidden.?,
+            &mtp_state,
+            initial_next_token.prefix_match,
+            prefix_reuse.reuse_len,
+        );
+        if (!mtp_ready) break :mtp_decode;
+
+        var verifier_state = try ModelState.initBf16FullCaches(ctx.device, local_capacity);
+        defer verifier_state.deinit();
+        try verifier_state.copyPrefixFrom(&work_state, prompt_ids.len - prefix_reuse.reuse_len);
+
+        var draft_token = try ctx.device.createSharedBuffer(@sizeOf(u32));
+        defer draft_token.destroy();
+        var verify_token = try ctx.device.createSharedBuffer(@sizeOf(u32));
+        defer verify_token.destroy();
+        var bonus_token = try ctx.device.createSharedBuffer(@sizeOf(u32));
+        defer bonus_token.destroy();
+        var advance_token = try ctx.device.createSharedBuffer(@sizeOf(u32));
+        defer advance_token.destroy();
+        var verifier_hidden = try ctx.device.createPrivateBuffer(try hiddenRowsBytes(2));
+        defer verifier_hidden.destroy();
+        var single_hidden = try ctx.device.createPrivateBuffer(try hiddenRowsBytes(1));
+        defer single_hidden.destroy();
+
+        if (metrics_ptr) |metrics| metrics.decode_start_ns = monotonicNowNs();
+        const generated = try decode_loop.decodeSpeculativeFromPrefixCache(.{
+            .device = ctx.device,
+            .queue = ctx.queue,
+            .model = ctx.model,
+            .drafter = drafter,
+            .eos_id = ctx.tok.eos_id,
+            .prompt_len = prompt_ids.len,
+            .prefix_len = prefix_reuse.reuse_len,
+            .state = &work_state,
+            .verifier_state = &verifier_state,
+            .mtp_state = &mtp_state,
+            .prefix = decode_prefix,
+            .initial_next_token = initial_next_token.token,
+            .initial_hidden_rows = mtp_prompt_hidden.?,
+            .initial_hidden_row = @intCast(prompt_ids.len - 1),
+            .next_token = work_next_token,
+            .draft_token = draft_token,
+            .verify_token = verify_token,
+            .bonus_token = bonus_token,
+            .advance_token = advance_token,
+            .verifier_hidden = verifier_hidden,
+            .single_hidden = single_hidden,
+            .out = out,
+            .callback = callback,
+            .stop_token_sequences = stop_token_sequences,
+            .trace = ctx.trace_prefill,
+            .metrics = metrics_ptr,
+        });
+        if (ctx.trace_prefill) logDecodeMetrics("mtp", &decode_metrics, prompt_ids.len, out.len, generated, prefill_done_ns);
+        return generated;
+    }
+    if (metrics_ptr) |metrics| metrics.decode_start_ns = monotonicNowNs();
+    const generated = try decode_loop.decodeFromPrefixCache(.{
         .device = ctx.device,
         .queue = ctx.queue,
         .model = ctx.model,
@@ -756,14 +866,164 @@ fn generateWithPrefixCacheLocked(
         .prompt_len = prompt_ids.len,
         .prefix_len = prefix_reuse.reuse_len,
         .state = &work_state,
-        .prefix = ctx.prefix_cache.prefixState(initial_next_token.prefix_match),
+        .prefix = decode_prefix,
         .initial_next_token = initial_next_token.token,
         .next_token = work_next_token,
         .out = out,
         .callback = callback,
         .stop_token_sequences = stop_token_sequences,
         .trace = ctx.trace_prefill,
+        .metrics = metrics_ptr,
     });
+    if (ctx.trace_prefill) logDecodeMetrics("greedy", &decode_metrics, prompt_ids.len, out.len, generated, prefill_done_ns);
+    return generated;
+}
+
+fn logDecodeMetrics(
+    mode: []const u8,
+    metrics: *const decode_loop.Metrics,
+    prompt_tokens: usize,
+    max_new_tokens: usize,
+    generated_tokens: usize,
+    prefill_done_ns: u64,
+) void {
+    const end_ns = monotonicNowNs();
+    const prefill_ms = elapsedMs(metrics.request_start_ns, prefill_done_ns);
+    const setup_ms = elapsedMs(prefill_done_ns, metrics.decode_start_ns);
+    const decode_ms = elapsedMs(metrics.decode_start_ns, end_ns);
+    const ttft_ms = if (metrics.first_emit_ns) |first| elapsedMs(metrics.request_start_ns, first) else 0;
+    const emit_span_ms = if (metrics.first_emit_ns) |first| if (metrics.last_emit_ns) |last| elapsedMs(first, last) else 0 else 0;
+    const itl_ms = if (generated_tokens > 1) emit_span_ms / @as(f64, @floatFromInt(generated_tokens - 1)) else 0;
+    const tok_s = if (decode_ms > 0) @as(f64, @floatFromInt(generated_tokens)) * 1000.0 / decode_ms else 0;
+    const emit_tok_s = if (emit_span_ms > 0 and generated_tokens > 1) @as(f64, @floatFromInt(generated_tokens - 1)) * 1000.0 / emit_span_ms else 0;
+    const tokens_per_step = if (metrics.decode_steps > 0) @as(f64, @floatFromInt(generated_tokens)) / @as(f64, @floatFromInt(metrics.decode_steps)) else @as(f64, @floatFromInt(generated_tokens));
+    const acceptance = if (metrics.attempted > 0) @as(f64, @floatFromInt(metrics.accepted)) / @as(f64, @floatFromInt(metrics.attempted)) else 0;
+    log.info(
+        "trace: decode metrics mode={s} prompt_tokens={d} max_new_tokens={d} generated_tokens={d} prefill_ms={d:.3} setup_ms={d:.3} ttft_ms={d:.3} decode_ms={d:.3} tok_s={d:.3} itl_ms={d:.3} emit_tok_s={d:.3} decode_steps={d} tokens_per_step={d:.3} accepted={d} attempted={d} acceptance={d:.3}",
+        .{
+            mode,
+            prompt_tokens,
+            max_new_tokens,
+            generated_tokens,
+            prefill_ms,
+            setup_ms,
+            ttft_ms,
+            decode_ms,
+            tok_s,
+            itl_ms,
+            emit_tok_s,
+            metrics.decode_steps,
+            tokens_per_step,
+            metrics.accepted,
+            metrics.attempted,
+            acceptance,
+        },
+    );
+}
+
+fn elapsedMs(start_ns: u64, end_ns: u64) f64 {
+    if (start_ns == 0 or end_ns <= start_ns) return 0;
+    return msFromNs(end_ns - start_ns);
+}
+
+/// Seed the MTP drafter's state from the target's normalized prompt hidden
+/// states so decode can start without a full prompt replay through the target.
+///
+/// `prompt_hidden` already holds the target's normalized hidden rows for the
+/// full prompt when prefill ran. When prefill was skipped because the entire
+/// prompt was cached with a valid next token (the `initialNextTokenFromPrefix`
+/// early return), the cached entry's hidden buffer is copied into
+/// `prompt_hidden` first; if the cache has no hidden buffer (e.g. a v1 prefix
+/// state file loaded without hiddens), MTP is disabled for this request.
+///
+/// The drafter pairs `normed_hidden[t]` with `embedding[t+1]` to predict
+/// `token[t+1]`, so it consumes `prompt_ids[1..]` and the first `len-1`
+/// hidden rows. Returns false when the drafter could not be seeded.
+fn seedMtpDrafter(
+    ctx: *Context,
+    drafter: *mtp_mod.Drafter,
+    prompt_ids: []const u32,
+    prompt_hidden: metal.Buffer,
+    mtp_state: *mtp_mod.State,
+    prefix_match: ?prefix_state_cache.Match,
+    reuse_len: usize,
+) !bool {
+    // The prompt-hidden buffer is populated by prefill for the suffix past the
+    // reused prefix. When a prefix is reused, rows 0..reuse_len were not
+    // recomputed (they came from the cache), so copy them from the cached
+    // entry's hidden buffer. When the entire prompt was cached (prefill
+    // skipped), all rows come from the cache.
+    //
+    // A cached entry may have an allocated-but-zero hidden buffer (a v3 file
+    // written by a non-MTP run, or a prefix cached before MTP captured rows).
+    // Gate on `entryHiddenValid` rather than nullness so all-zero hiddens don't
+    // silently produce ~0% acceptance; fall back to greedy decode instead.
+    if (reuse_len != 0) {
+        if (prefix_match) |match| {
+            if (ctx.prefix_cache.entryHiddenValid(match)) {
+                if (ctx.prefix_cache.entryHidden(match)) |cached_hidden| {
+                    const prefix_bytes = try hiddenRowsBytes(@intCast(reuse_len));
+                    if (cached_hidden.length < prefix_bytes) {
+                        log.warn("MTP decode disabled: cached hidden buffer too small", .{});
+                        return false;
+                    }
+                    @memcpy(prompt_hidden.slice(u8)[0..prefix_bytes], cached_hidden.slice(u8)[0..prefix_bytes]);
+                } else {
+                    log.warn("MTP decode disabled for request: hidden_valid but no hidden buffer", .{});
+                    return false;
+                }
+            } else {
+                log.warn("MTP decode disabled for request: cached prefix has no real hidden states; rerun with --mtp after re-prewarming", .{});
+                return false;
+            }
+        } else {
+            log.warn("MTP decode disabled for request: reuse_len={d} with no cache match", .{reuse_len});
+            return false;
+        }
+    }
+
+    // Run the drafter prefill over prompt_ids[1..] using the target hiddens.
+    // This is cheap (one drafter layer, no target forward) and populates the
+    // drafter KV for the prompt so decode can advance from the prompt tail.
+    if (prompt_ids.len < 2) return true;
+    const drafter_tokens = prompt_ids[1..];
+    var pos: usize = 0;
+    const mtp_prompt_tokens = drafter_tokens.len;
+    while (pos < mtp_prompt_tokens) {
+        const chunk_end = @min(mtp_prompt_tokens, pos + ctx.prefill_chunk_tokens);
+        const chunk = drafter_tokens[pos..chunk_end];
+        if (chunk.len == 0) break;
+        const chunk_len_u32 = std.math.cast(u32, chunk.len) orelse return error.SequenceTooLong;
+        const pos_u32 = std.math.cast(u32, pos) orelse return error.SequenceTooLong;
+
+        if (ctx.trace_prefill) {
+            log.info(
+                "trace: mtp drafter prefill chunk pos={d}..{d}/{d}",
+                .{ pos, chunk_end, mtp_prompt_tokens },
+            );
+        }
+        // The drafter consumes target_hidden[t] for token[t+1], so feed the
+        // hidden rows aligned with `prompt_ids[pos]` (i.e. prompt_hidden at
+        // row pos) and the drafter tokens `prompt_ids[pos+1..]`.
+        const chunk_hidden_bytes = try hiddenRowsBytes(chunk_len_u32);
+        const src_off = try hiddenRowsBytes(pos_u32);
+        if (prompt_hidden.length < src_off + chunk_hidden_bytes) return error.InputBufferTooSmall;
+        var chunk_hidden = try ctx.device.createPrivateBuffer(chunk_hidden_bytes);
+        defer chunk_hidden.destroy();
+        try ctx.queue.copyBuffer(prompt_hidden, src_off, chunk_hidden, 0, chunk_hidden_bytes);
+        try drafter.forwardPrefill(
+            ctx.device,
+            ctx.queue,
+            ctx.model,
+            chunk,
+            chunk_hidden,
+            mtp_state,
+            pos_u32,
+            pos_u32,
+        );
+        pos = chunk_end;
+    }
+    return true;
 }
 
 fn resolveReusablePrefix(
@@ -840,6 +1100,7 @@ fn initialNextTokenFromPrefix(
     callback: ?DeviceModel.GeneratedTokenCallback,
     cache_store_limit: ?usize,
     pinned: bool,
+    full_prompt_hidden: ?metal.Buffer,
 ) !InitialNextToken {
     const cache = &ctx.prefix_cache;
     if (prefix_match) |match| {
@@ -847,7 +1108,7 @@ fn initialNextTokenFromPrefix(
             return .{ .prefix_match = match, .token = cache.cachedNextToken(match) };
         }
     }
-    const decode_prefix_match = try prefillPromptWithPrefixCache(ctx, prompt_ids, prefix_match, work_state, work_next_token, callback, cache_store_limit, pinned);
+    const decode_prefix_match = try prefillPromptWithPrefixCache(ctx, prompt_ids, prefix_match, work_state, work_next_token, callback, cache_store_limit, pinned, full_prompt_hidden);
     return .{ .prefix_match = decode_prefix_match, .token = work_next_token.slice(u32)[0] };
 }
 
@@ -870,13 +1131,21 @@ fn prewarmStaticPromptTokenPrefixLocked(
     const prefix_len = prefix_matching.boundedStaticReuseLen(static_ids, prompt_ids, ctx.prefix_cache.max_tokens, ctx.max_total);
     if (prefix_len == 0) return null;
     if (ctx.prefix_cache.containsPromptPrefix(prompt_ids, prefix_len)) return prefix_len;
-    _ = try prewarmPromptCacheLockedWithCallback(ctx, prompt_ids[0..prefix_len], prompt_ids.len, callback, true);
+    _ = prewarmPromptCacheLockedWithCallback(ctx, prompt_ids[0..prefix_len], prompt_ids.len, callback, false) catch |err| switch (err) {
+        error.SequenceTooLong => {
+            log.warn("static prefix cache is full; continuing request without static-prefix prewarm", .{});
+            return null;
+        },
+        else => return err,
+    };
     return prefix_len;
 }
 
 fn shouldPreserveUnmatchedCache(cache_store_limit: ?usize, cached_entry_count: usize) bool {
     return cache_store_limit == null and cached_entry_count != 0;
 }
+
+const hiddenRowsBytes = model_mod.dims.hiddenRowsBytes;
 
 fn shouldDirectFillEmptyPromptCache(
     cache_store_limit: ?usize,
@@ -901,6 +1170,7 @@ fn prefillPromptWithPrefixCache(
     callback: ?DeviceModel.GeneratedTokenCallback,
     cache_store_limit: ?usize,
     pinned: bool,
+    full_prompt_hidden: ?metal.Buffer,
 ) !?prefix_state_cache.Match {
     const cache = &ctx.prefix_cache;
     const prefix_len = if (prefix_match) |match| match.len else 0;
@@ -913,10 +1183,17 @@ fn prefillPromptWithPrefixCache(
     var prefix = cache.prefixState(decode_prefix_match);
     var pos = prefix_len;
 
+    // When MTP hidden tracking is on, capture the target's normalized hidden
+    // states so the drafter can be seeded from the cache instead of replaying
+    // the full prompt. `full_prompt_hidden` covers the whole prompt; the
+    // cacheable-prefix segment captures into it and a copy is stored in the
+    // cache entry, the suffix segment captures the remainder for the drafter.
+    const capture_hidden = full_prompt_hidden != null;
+
     if (pos < cache_target and prefixShouldStore(cache, prompt_ids[0..cache_target], prefix_match)) {
-        try prefillPromptSegment(ctx, prompt_ids, work_state, prefix, work_next_token, prefix_len, pos, cache_target, callback);
+        try prefillPromptSegment(ctx, prompt_ids, work_state, prefix, work_next_token, prefix_len, pos, cache_target, callback, if (capture_hidden) full_prompt_hidden else null, pos);
         pos = cache_target;
-        const stored = try storePromptPrefixCache(ctx, prompt_ids[0..cache_target], prefix_match, work_state, work_next_token, pinned);
+        const stored = try storePromptPrefixCache(ctx, prompt_ids[0..cache_target], prefix_match, work_state, full_prompt_hidden, prefix_len, work_next_token, pinned);
         if (prefix_len != 0) {
             decode_prefix_match = .{ .index = stored.index, .len = prefix_len };
             prefix = cache.prefixState(decode_prefix_match);
@@ -924,7 +1201,7 @@ fn prefillPromptWithPrefixCache(
     }
 
     if (pos < prompt_ids.len) {
-        try prefillPromptSegment(ctx, prompt_ids, work_state, prefix, work_next_token, prefix_len, pos, prompt_ids.len, callback);
+        try prefillPromptSegment(ctx, prompt_ids, work_state, prefix, work_next_token, prefix_len, pos, prompt_ids.len, callback, if (capture_hidden) full_prompt_hidden else null, pos);
     }
     return decode_prefix_match;
 }
@@ -939,6 +1216,8 @@ fn prefillPromptSegment(
     start_pos: usize,
     end_pos: usize,
     callback: ?DeviceModel.GeneratedTokenCallback,
+    hidden_output: ?metal.Buffer,
+    hidden_output_base_rows: usize,
 ) !void {
     try prefill_mod.prefillSegment(ctx.model, ctx.device, ctx.queue, prompt_ids, work_state, prefix, work_next_token, .{
         .prefix_len = prefix_len,
@@ -948,6 +1227,8 @@ fn prefillPromptSegment(
         .chunk_group_size = ctx.prefill_chunk_group_size,
         .trace = ctx.trace_prefill,
         .callback = callback,
+        .hidden_output = hidden_output,
+        .hidden_output_base_rows = hidden_output_base_rows,
     });
 }
 
@@ -966,11 +1247,13 @@ fn storePromptPrefixCache(
     prefix_ids: []const u32,
     prefix_match: ?prefix_state_cache.Match,
     work_state: *const ModelState,
+    work_hidden: ?metal.Buffer,
+    work_hidden_base_rows: usize,
     next_token: ?metal.Buffer,
     pinned: bool,
 ) !prefix_state_cache.Match {
     if (prefix_ids.len == 0) return error.EmptyInput;
-    return ctx.prefix_cache.storePrefixFromWork(ctx.request_gpa, ctx.device, prefix_ids, prefix_match, work_state, next_token, pinned);
+    return ctx.prefix_cache.storePrefixFromWork(ctx.request_gpa, ctx.device, prefix_ids, prefix_match, work_state, work_hidden, work_hidden_base_rows, next_token, pinned);
 }
 
 const WarmupResult = struct {
@@ -1060,8 +1343,16 @@ fn prefillStaticPrefixCacheDirect(
     errdefer if (!committed) cache.removeEntry(ctx.request_gpa, match.index);
     var next_token = try ctx.device.createSharedBuffer(@sizeOf(u32));
     defer next_token.destroy();
-    try prefillPromptSegment(ctx, prefix_ids, cache.entryStateMut(match), null, next_token, 0, 0, prefix_ids.len, callback);
+    var work_hidden: ?metal.Buffer = null;
+    defer if (work_hidden) |*buf| buf.destroy();
+    if (cache.hiddenTrackingEnabled()) {
+        work_hidden = try ctx.device.createSharedBuffer(try hiddenRowsBytes(@intCast(prefix_ids.len)));
+    }
+    try prefillPromptSegment(ctx, prefix_ids, cache.entryStateMut(match), null, next_token, 0, 0, prefix_ids.len, callback, work_hidden, 0);
     try cache.finishDirectEntry(match, next_token);
+    if (work_hidden) |buf| {
+        try cache.setEntryHidden(ctx.device, match, buf);
+    }
     committed = true;
     return match;
 }
@@ -1077,10 +1368,16 @@ fn prefillStaticPrefixCacheOnly(
 ) !prefix_state_cache.Match {
     const prefix_len = prefix_match.len;
     const prefix = ctx.prefix_cache.prefixState(prefix_match);
-    if (prefix_len < prefix_ids.len) {
-        try prefillPromptSegment(ctx, prefix_ids, work_state, prefix, work_next_token, prefix_len, prefix_len, prefix_ids.len, callback);
+    var work_hidden: ?metal.Buffer = null;
+    defer if (work_hidden) |*buf| buf.destroy();
+    if (ctx.prefix_cache.hiddenTrackingEnabled() and prefix_ids.len > prefix_len) {
+        const segment_rows = prefix_ids.len - prefix_len;
+        work_hidden = try ctx.device.createSharedBuffer(try hiddenRowsBytes(@intCast(segment_rows)));
     }
-    return storePromptPrefixCache(ctx, prefix_ids, prefix_match, work_state, work_next_token, pinned);
+    if (prefix_len < prefix_ids.len) {
+        try prefillPromptSegment(ctx, prefix_ids, work_state, prefix, work_next_token, prefix_len, prefix_len, prefix_ids.len, callback, work_hidden, 0);
+    }
+    return storePromptPrefixCache(ctx, prefix_ids, prefix_match, work_state, work_hidden, 0, work_next_token, pinned);
 }
 
 fn complete(ctx: *Context, prompt: []const u8, cache_prefix_prompt: ?[]const u8, max_new: u32, stop: []const []const u8) !Completion {

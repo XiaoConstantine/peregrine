@@ -123,4 +123,35 @@ kernel void copy_row_bf16(
     if (i >= width) return;
     output[i] = input[(ulong)row * width + i];
 }
+
+// Write a single bf16 row into a row-major matrix.
+kernel void write_row_bf16(
+    device const bfloat *input [[buffer(0)]],
+    device bfloat *output [[buffer(1)]],
+    constant uint &row [[buffer(2)]],
+    constant uint &width [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= width) return;
+    output[(ulong)row * width + i] = input[i];
+}
+
+// Row-wise concat for Qwen3.5 MTP pre-fc input:
+// out[row, i] = a[row, i], out[row, width + i] = b[row, i].
+kernel void concat_two_rows_bf16(
+    device const bfloat *a [[buffer(0)]],
+    device const bfloat *b [[buffer(1)]],
+    device bfloat *out [[buffer(2)]],
+    constant uint &width [[buffer(3)]],
+    constant uint &rows [[buffer(4)]],
+    uint i [[thread_position_in_grid]])
+{
+    const uint total = width * rows;
+    if (i >= total) return;
+    const uint row = i / width;
+    const uint col = i - row * width;
+    const ulong out_base = (ulong)row * (ulong)width * 2ul;
+    out[out_base + col] = a[i];
+    out[out_base + (ulong)width + col] = b[i];
+}
 #endif

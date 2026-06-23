@@ -68,6 +68,36 @@ Override limits when needed:
 Use `--dry-run` to print the exact `zig-out/bin/peregrine` command without
 starting the server.
 
+## Experimental MTP Decode
+
+Peregrine can run an optional MTP sidecar for speculative decode:
+
+```sh
+hf download mlx-community/Qwen3.5-9B-MTP-4bit --local-dir /tmp/qwen3.5-9b-mtp-q4
+./scripts/run-qwen35 serve --mtp
+```
+
+`--mtp` finds the sidecar from `$PEREGRINE_QWEN35_MTP_REPO`, the Hugging Face
+cache, or `/tmp/qwen3.5-9b-mtp-q4`. To override discovery, pass it explicitly:
+
+```sh
+./scripts/run-qwen35 serve --mtp-dir /path/to/compatible-qwen3.5-9b-mtp-q4
+```
+
+The sidecar must match the target model fingerprint. Without `--mtp` or
+`--mtp-dir`, serving uses the normal decode path.
+
+With `--mtp`, the prefix cache also stores the target's normalized prompt
+hidden states alongside the KV cache, and the persisted prefix-state file
+includes them (format version 3; older files are rebuilt on first start). The
+drafter is seeded from the cached prefix hiddens, so a warm prefix avoids
+replaying the prompt through the target and drafter on every request. A
+cached prefix without real hidden states (e.g. a file written by a non-MTP
+run, or a prefix cached before MTP captured rows) disables MTP for that
+request and falls back to normal decode until the prefix is re-prewarmed
+under `--mtp`. The persisted prefix-state file format is version 3; older
+files are rebuilt on first start.
+
 ## API Surface
 
 Metadata:

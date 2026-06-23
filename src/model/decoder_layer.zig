@@ -43,7 +43,9 @@ const CorePipelines = struct {
     silu_mul_pair_bf16: metal.Pipeline,
     sigmoid_mul_pair_bf16: metal.Pipeline,
     qmv_residual_add_bf16: metal.Pipeline,
+    qmv_residual_add2_bf16: metal.Pipeline,
     qmv_gate_up_silu_bf16: metal.Pipeline,
+    qmv_gate_up_silu2_bf16: metal.Pipeline,
     qmm_m32n64_nt_bf16: metal.Pipeline,
     qmm_m32n64_nt_residual_add_bf16: metal.Pipeline,
     mlx_nt_bf16: mlx_nt.Pipelines,
@@ -64,8 +66,12 @@ const CorePipelines = struct {
         errdefer sigmoid_mul_pair_bf16.destroy();
         var qmv_residual_add_bf16 = try device.createPipeline(library, "linear_q4_affine_group64_qmv_fast_residual_add_bf16");
         errdefer qmv_residual_add_bf16.destroy();
+        var qmv_residual_add2_bf16 = try device.createPipeline(library, "linear_q4_affine_group64_qmv2_fast_residual_add_bf16");
+        errdefer qmv_residual_add2_bf16.destroy();
         var qmv_gate_up_silu_bf16 = try device.createPipeline(library, block_mlp.decode_mlp_gate_up_silu_bf16_kernel_name);
         errdefer qmv_gate_up_silu_bf16.destroy();
+        var qmv_gate_up_silu2_bf16 = try device.createPipeline(library, block_mlp.decode_mlp_gate_up_silu2_bf16_kernel_name);
+        errdefer qmv_gate_up_silu2_bf16.destroy();
         var qmm_m32n64_nt_bf16 = try device.createPipeline(library, "linear_q4_affine_group64_prefill_qmm_m32n64_nt_bf16_tiles_bf16");
         errdefer qmm_m32n64_nt_bf16.destroy();
         var qmm_m32n64_nt_residual_add_bf16 = try device.createPipeline(library, "linear_q4_affine_group64_prefill_qmm_m32n64_nt_bf16_tiles_residual_add_bf16");
@@ -82,7 +88,9 @@ const CorePipelines = struct {
             .silu_mul_pair_bf16 = silu_mul_pair_bf16,
             .sigmoid_mul_pair_bf16 = sigmoid_mul_pair_bf16,
             .qmv_residual_add_bf16 = qmv_residual_add_bf16,
+            .qmv_residual_add2_bf16 = qmv_residual_add2_bf16,
             .qmv_gate_up_silu_bf16 = qmv_gate_up_silu_bf16,
+            .qmv_gate_up_silu2_bf16 = qmv_gate_up_silu2_bf16,
             .qmm_m32n64_nt_bf16 = qmm_m32n64_nt_bf16,
             .qmm_m32n64_nt_residual_add_bf16 = qmm_m32n64_nt_residual_add_bf16,
             .mlx_nt_bf16 = mlx_nt_bf16,
@@ -98,7 +106,9 @@ const CorePipelines = struct {
         self.silu_mul_pair_bf16.destroy();
         self.sigmoid_mul_pair_bf16.destroy();
         self.qmv_residual_add_bf16.destroy();
+        self.qmv_residual_add2_bf16.destroy();
         self.qmv_gate_up_silu_bf16.destroy();
+        self.qmv_gate_up_silu2_bf16.destroy();
         self.qmm_m32n64_nt_bf16.destroy();
         self.qmm_m32n64_nt_residual_add_bf16.destroy();
         self.mlx_nt_bf16.destroy();
@@ -365,17 +375,32 @@ pub const DecoderLayer = struct {
 
     pub fn upload(device: *metal.Device, queue: *metal.Queue, repo: *const safetensors.Repository, layer_idx: usize) !DecoderLayer {
         var key: [256]u8 = undefined;
-        var input_norm = try weight_upload.namedTensorPrivate(device, queue, repo, try std.fmt.bufPrint(&key, "language_model.model.layers.{d}.input_layernorm.weight", .{layer_idx}));
+        const prefix = try std.fmt.bufPrint(&key, "language_model.model.layers.{d}", .{layer_idx});
+        return uploadWithAttn(device, queue, repo, prefix, if (isLinear(layer_idx)) .linear else .full);
+    }
+
+    pub fn uploadFullAttention(device: *metal.Device, queue: *metal.Queue, repo: *const safetensors.Repository, prefix: []const u8) !DecoderLayer {
+        return uploadWithAttn(device, queue, repo, prefix, .full);
+    }
+
+    const UploadAttn = enum { full, linear };
+
+    fn uploadWithAttn(device: *metal.Device, queue: *metal.Queue, repo: *const safetensors.Repository, prefix: []const u8, attn_kind: UploadAttn) !DecoderLayer {
+        var key: [256]u8 = undefined;
+        var input_norm = try weight_upload.namedTensorPrivate(device, queue, repo, try std.fmt.bufPrint(&key, "{s}.input_layernorm.weight", .{prefix}));
         errdefer input_norm.destroy();
-        var post_norm = try weight_upload.namedTensorPrivate(device, queue, repo, try std.fmt.bufPrint(&key, "language_model.model.layers.{d}.post_attention_layernorm.weight", .{layer_idx}));
+        var post_norm = try weight_upload.namedTensorPrivate(device, queue, repo, try std.fmt.bufPrint(&key, "{s}.post_attention_layernorm.weight", .{prefix}));
         errdefer post_norm.destroy();
-        var mlp = try block_mlp.MlpBlock.upload(device, queue, repo, try std.fmt.bufPrint(&key, "language_model.model.layers.{d}.mlp", .{layer_idx}));
+        var mlp = try block_mlp.MlpBlock.upload(device, queue, repo, try std.fmt.bufPrint(&key, "{s}.mlp", .{prefix}));
         errdefer mlp.deinit();
 
-        const attn: Attn = if (isLinear(layer_idx)) .{
-            .linear = try block_linear.LinearAttentionBlock.upload(device, queue, repo, try std.fmt.bufPrint(&key, "language_model.model.layers.{d}.linear_attn", .{layer_idx})),
-        } else .{
-            .full = try block_attn.FullAttentionBlock.upload(device, queue, repo, try std.fmt.bufPrint(&key, "language_model.model.layers.{d}.self_attn", .{layer_idx})),
+        const attn: Attn = switch (attn_kind) {
+            .linear => .{
+                .linear = try block_linear.LinearAttentionBlock.upload(device, queue, repo, try std.fmt.bufPrint(&key, "{s}.linear_attn", .{prefix})),
+            },
+            .full => .{
+                .full = try block_attn.FullAttentionBlock.upload(device, queue, repo, try std.fmt.bufPrint(&key, "{s}.self_attn", .{prefix})),
+            },
         };
         return .{ .input_norm = input_norm, .post_norm = post_norm, .mlp = mlp, .attn = attn };
     }
@@ -450,11 +475,67 @@ pub const DecoderLayer = struct {
         if (x_bf16.length < hidden_bytes) return error.InputBufferTooSmall;
         if (out_bf16.length < hidden_bytes) return error.OutputBufferTooSmall;
 
+        const attn_out_bf16 = try ws.scratch(hidden_bytes);
+        try self.encodeAttentionDecodeBf16(ws, p, x_bf16, state, cache_pos, rope_pos, seq_len, prefix_state, prefix_len, attn_out_bf16);
+        ws.barrier();
+
+        try self.encodePostAttentionMlpDecodeBf16(ws, p, x_bf16, attn_out_bf16, out_bf16);
+    }
+
+    pub fn decodeStep2Bf16(
+        self: *DecoderLayer,
+        ws: *metal.Workspace,
+        p: LayerPipelines,
+        x0_bf16: metal.Buffer,
+        x1_bf16: metal.Buffer,
+        state: *LayerState,
+        start_cache_pos: u32,
+        start_rope_pos: u32,
+        start_seq_len: u32,
+        prefix_state: ?*const LayerState,
+        prefix_len: u32,
+        out0_bf16: metal.Buffer,
+        out1_bf16: metal.Buffer,
+    ) !void {
+        const hidden_bytes = try hiddenBf16Bytes(1);
+        if (x0_bf16.length < hidden_bytes or x1_bf16.length < hidden_bytes) return error.InputBufferTooSmall;
+        if (out0_bf16.length < hidden_bytes or out1_bf16.length < hidden_bytes) return error.OutputBufferTooSmall;
+
+        const second_cache_pos = std.math.add(u32, start_cache_pos, 1) catch return error.SequenceTooLong;
+        const second_rope_pos = std.math.add(u32, start_rope_pos, 1) catch return error.SequenceTooLong;
+        const second_seq_len = std.math.add(u32, start_seq_len, 1) catch return error.SequenceTooLong;
+
+        const attn0_bf16 = try ws.scratch(hidden_bytes);
+        try self.encodeAttentionDecodeBf16(ws, p, x0_bf16, state, start_cache_pos, start_rope_pos, start_seq_len, prefix_state, prefix_len, attn0_bf16);
+        ws.barrier();
+        const attn1_bf16 = try ws.scratch(hidden_bytes);
+        try self.encodeAttentionDecodeBf16(ws, p, x1_bf16, state, second_cache_pos, second_rope_pos, second_seq_len, prefix_state, prefix_len, attn1_bf16);
+        ws.barrier();
+
+        try self.encodePostAttentionMlpDecode2Bf16(ws, p, x0_bf16, x1_bf16, attn0_bf16, attn1_bf16, out0_bf16, out1_bf16);
+    }
+
+    fn encodeAttentionDecodeBf16(
+        self: *DecoderLayer,
+        ws: *metal.Workspace,
+        p: LayerPipelines,
+        x_bf16: metal.Buffer,
+        state: *LayerState,
+        cache_pos: u32,
+        rope_pos: u32,
+        seq_len: u32,
+        prefix_state: ?*const LayerState,
+        prefix_len: u32,
+        attn_out_bf16: metal.Buffer,
+    ) !void {
+        const hidden_bytes = try hiddenBf16Bytes(1);
+        if (x_bf16.length < hidden_bytes) return error.InputBufferTooSmall;
+        if (attn_out_bf16.length < hidden_bytes) return error.OutputBufferTooSmall;
+
         const normed_bf16 = try ws.scratch(hidden_bytes);
         try encodeRmsNormBf16(ws, p, x_bf16, self.input_norm, 1, normed_bf16);
         ws.barrier();
 
-        const attn_out_bf16 = try ws.scratch(hidden_bytes);
         switch (self.attn) {
             .full => |*b| {
                 if (state.* != .full) return error.LayerStateMismatch;
@@ -485,9 +566,6 @@ pub const DecoderLayer = struct {
                 );
             },
         }
-
-        ws.barrier();
-        try self.encodePostAttentionMlpDecodeBf16(ws, p, x_bf16, attn_out_bf16, out_bf16);
     }
 
     fn encodeInputNormBf16(
@@ -699,6 +777,43 @@ pub const DecoderLayer = struct {
             post_attention_normed,
             attention_residual,
             out_bf16,
+        );
+    }
+
+    fn encodePostAttentionMlpDecode2Bf16(
+        self: *DecoderLayer,
+        ws: *metal.Workspace,
+        p: LayerPipelines,
+        x0_bf16: metal.Buffer,
+        x1_bf16: metal.Buffer,
+        attn0_out_bf16: metal.Buffer,
+        attn1_out_bf16: metal.Buffer,
+        out0_bf16: metal.Buffer,
+        out1_bf16: metal.Buffer,
+    ) !void {
+        const hidden_bytes = try hiddenBf16Bytes(1);
+        if (x0_bf16.length < hidden_bytes or x1_bf16.length < hidden_bytes) return error.InputBufferTooSmall;
+        if (attn0_out_bf16.length < hidden_bytes or attn1_out_bf16.length < hidden_bytes) return error.InputBufferTooSmall;
+        if (out0_bf16.length < hidden_bytes or out1_bf16.length < hidden_bytes) return error.OutputBufferTooSmall;
+
+        const attention0_residual = try ws.scratch(hidden_bytes);
+        const attention1_residual = try ws.scratch(hidden_bytes);
+        const post0_attention_normed = try ws.scratch(hidden_bytes);
+        const post1_attention_normed = try ws.scratch(hidden_bytes);
+        try encodeAddRmsNormBf16(ws, p, x0_bf16, attn0_out_bf16, self.post_norm, attention0_residual, post0_attention_normed, 1);
+        try encodeAddRmsNormBf16(ws, p, x1_bf16, attn1_out_bf16, self.post_norm, attention1_residual, post1_attention_normed, 1);
+        ws.barrier();
+
+        try self.mlp.decodeResidual2Bf16(
+            ws,
+            p.core.qmv_gate_up_silu2_bf16,
+            p.core.qmv_residual_add2_bf16,
+            post0_attention_normed,
+            post1_attention_normed,
+            attention0_residual,
+            attention1_residual,
+            out0_bf16,
+            out1_bf16,
         );
     }
 };

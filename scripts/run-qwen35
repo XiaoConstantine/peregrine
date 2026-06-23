@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 usage:
-  tools/run-qwen35 [serve] [--host HOST] [--port PORT] [--repo DIR] [--agent-optimized|--no-agent-optimized] [--max-total-tokens N] [--default-new-tokens N] [--max-new-tokens N] [--prefix-cache-tokens N] [--prefill-chunk-tokens N] [--prefill-chunk-group N] [--max-active-connections N] [--socket-timeout-s N] [--prewarm-prompt-file FILE] [--prewarm-request-file FILE] [--no-auto-prewarm] [--prefix-state-file FILE] [--no-prefix-state] [--dry-run]
+  scripts/run-qwen35 [serve] [--host HOST] [--port PORT] [--repo DIR] [--agent-optimized|--no-agent-optimized] [--max-total-tokens N] [--default-new-tokens N] [--max-new-tokens N] [--prefix-cache-tokens N] [--prefill-chunk-tokens N] [--prefill-chunk-group N] [--max-active-connections N] [--socket-timeout-s N] [--prewarm-prompt-file FILE] [--prewarm-request-file FILE] [--no-auto-prewarm] [--prefix-state-file FILE] [--no-prefix-state] [--mtp|--mtp-dir DIR] [--dry-run]
 
 Defaults:
   mode:              serve
@@ -19,7 +19,9 @@ Defaults:
   prewarm:           auto from $PEREGRINE_PI_PREWARM_REQUEST or /tmp/pi-peregrine-request.json
   prefix state:      persisted to ~/.cache/peregrine/ after startup prewarm and
                      reloaded on the next start (disable with --no-prefix-state)
+  mtp:               disabled unless --mtp is set or --mtp-dir points at a compatible sidecar
   repo:              $PEREGRINE_QWEN35_REPO, newest HF cache snapshot, or /tmp/qwen3.5-9b-q4
+  mtp repo:          $PEREGRINE_QWEN35_MTP_REPO, newest HF cache snapshot, or /tmp/qwen3.5-9b-mtp-q4
   build:             zig build -Doptimize=ReleaseFast
 EOF
 }
@@ -74,6 +76,41 @@ find_repo() {
   die "could not find mlx-community/Qwen3.5-9B-4bit; set PEREGRINE_QWEN35_REPO or pass --repo"
 }
 
+find_mtp_repo() {
+  if [[ -n "${PEREGRINE_QWEN35_MTP_REPO:-}" ]]; then
+    [[ -d "$PEREGRINE_QWEN35_MTP_REPO" ]] || die "PEREGRINE_QWEN35_MTP_REPO does not exist: $PEREGRINE_QWEN35_MTP_REPO"
+    printf '%s\n' "$PEREGRINE_QWEN35_MTP_REPO"
+    return
+  fi
+
+  local cache_dir="$HOME/.cache/huggingface/hub/models--mlx-community--Qwen3.5-9B-MTP-4bit/snapshots"
+  local best=""
+  local best_mtime=0
+  if [[ -d "$cache_dir" ]]; then
+    local snapshot
+    for snapshot in "$cache_dir"/*; do
+      [[ -d "$snapshot" ]] || continue
+      local ts
+      ts="$(mtime "$snapshot")"
+      if (( ts > best_mtime )); then
+        best_mtime="$ts"
+        best="$snapshot"
+      fi
+    done
+  fi
+  if [[ -n "$best" ]]; then
+    printf '%s\n' "$best"
+    return
+  fi
+
+  if [[ -d /tmp/qwen3.5-9b-mtp-q4 ]]; then
+    printf '%s\n' /tmp/qwen3.5-9b-mtp-q4
+    return
+  fi
+
+  die "could not find mlx-community/Qwen3.5-9B-MTP-4bit; run 'hf download mlx-community/Qwen3.5-9B-MTP-4bit', set PEREGRINE_QWEN35_MTP_REPO, or pass --mtp-dir"
+}
+
 build_release() {
   local root="$1"
   printf 'peregrine: building ReleaseFast...\n' >&2
@@ -111,6 +148,8 @@ main() {
   local auto_prewarm="1"
   local prefix_state_file=""
   local prefix_state="1"
+  local mtp_enabled="0"
+  local mtp_dir=""
   local dry_run="0"
 
   while [[ $# -gt 0 ]]; do
@@ -201,6 +240,16 @@ main() {
         prefix_state="0"
         shift
         ;;
+      --mtp)
+        mtp_enabled="1"
+        shift
+        ;;
+      --mtp-dir)
+        [[ $# -ge 2 ]] || die "--mtp-dir requires a value"
+        mtp_enabled="1"
+        mtp_dir="$2"
+        shift 2
+        ;;
       --dry-run)
         dry_run="1"
         shift
@@ -220,6 +269,12 @@ main() {
     repo="$(find_repo)"
   fi
   [[ -d "$repo" ]] || die "checkpoint directory does not exist: $repo"
+  if [[ "$mtp_enabled" == "1" && -z "$mtp_dir" ]]; then
+    mtp_dir="$(find_mtp_repo)"
+  fi
+  if [[ -n "$mtp_dir" ]]; then
+    [[ -d "$mtp_dir" ]] || die "MTP directory does not exist: $mtp_dir"
+  fi
 
   if [[ "$auto_prewarm" == "1" && -z "$prewarm_prompt_file" && -z "$prewarm_request_file" ]]; then
     if [[ -n "${PEREGRINE_PI_PREWARM_REQUEST:-}" ]]; then
@@ -272,6 +327,9 @@ main() {
   fi
   if [[ "$prefix_state" == "0" ]]; then
     args+=(--no-prefix-state)
+  fi
+  if [[ -n "$mtp_dir" ]]; then
+    args+=(--mtp-dir "$mtp_dir")
   fi
   if [[ "$dry_run" == "1" ]]; then
     print_dry_run "$root/zig-out/bin/peregrine" "${args[@]}"

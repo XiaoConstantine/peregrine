@@ -3,8 +3,10 @@
 const std = @import("std");
 const metal = @import("../runtime/metal.zig");
 const model_mod = @import("../model/model.zig");
+const dims = @import("../model/dims.zig");
 
 const ModelState = model_mod.ModelState;
+const hiddenRowsBytes = dims.hiddenRowsBytes;
 const log = std.log.scoped(.peregrine_prefix_cache);
 
 /// Stable only until the next cache mutation. Public mutators may evict entries
@@ -114,7 +116,7 @@ const PrefixIndex = struct {
         for (prompt[0..prefix_len]) |token| {
             node_index = self.findChild(node_index, token) orelse return false;
         }
-        return self.hasEntryInSubtree(node_index);
+        return self.nodes.items[node_index].entry_index != null;
     }
 
     fn decrementEntryIndexesAfter(self: *PrefixIndex, removed_index: usize) void {
@@ -212,6 +214,16 @@ const PrefixIndex = struct {
 
 pub const Entry = struct {
     cached_state: ModelState,
+    /// Normalized target hidden states for `tokens.items.len` prompt rows,
+    /// `[max_seq, HIDDEN]` bf16. Only allocated when hidden tracking is enabled
+    /// (MTP sidecar loaded); null otherwise.
+    hidden: ?metal.Buffer = null,
+    /// Whether `hidden` holds real captured rows for `tokens.items.len` rows.
+    /// False when the buffer is allocated-but-zero (e.g. a v3 file written by a
+    /// non-MTP run, or capacity allocated before any prefill captured rows).
+    /// Used to gate MTP drafter seeding so all-zero hiddens don't silently
+    /// produce ~0% acceptance.
+    hidden_valid: bool = false,
     cached_next_token: u32 = 0,
     cached_next_token_valid: bool = false,
     tokens: std.ArrayList(u32) = .empty,
@@ -230,6 +242,7 @@ pub const Entry = struct {
 
     fn deinit(self: *Entry, gpa: std.mem.Allocator) void {
         self.tokens.deinit(gpa);
+        if (self.hidden) |*buf| buf.destroy();
         self.cached_state.deinit();
         self.* = undefined;
     }
@@ -246,6 +259,34 @@ pub const Entry = struct {
         self.cached_state.deinit();
         self.cached_state = next;
     }
+
+    /// Allocate or grow the hidden buffer to at least `token_count` rows.
+    /// Existing rows are preserved up to the smaller of old and new capacity.
+    fn ensureHiddenCapacity(self: *Entry, device: *metal.Device, token_count: usize) !void {
+        const needed = try hiddenRowsBytes(@max(token_count, self.cached_state.max_seq));
+        if (self.hidden) |*buf| {
+            if (buf.length >= needed) return;
+            var next = try device.createSharedBuffer(needed);
+            errdefer next.destroy();
+            @memset(next.slice(u8), 0);
+            // Preserve the old buffer's valid rows. `tokens` may already have
+            // been grown past the old buffer's row capacity (replaceEntryPrefix
+            // resizes before this runs), so clamp to the old buffer's actual
+            // byte size to avoid an over-read.
+            const want_bytes = try hiddenRowsBytes(self.tokens.items.len);
+            const copy_bytes = @min(want_bytes, buf.length);
+            if (copy_bytes != 0) {
+                @memcpy(next.slice(u8)[0..copy_bytes], buf.slice(u8)[0..copy_bytes]);
+            }
+            buf.destroy();
+            self.hidden = next;
+            return;
+        }
+        var buf = try device.createSharedBuffer(needed);
+        errdefer buf.destroy();
+        @memset(buf.slice(u8), 0);
+        self.hidden = buf;
+    }
 };
 
 pub const Cache = struct {
@@ -261,6 +302,11 @@ pub const Cache = struct {
     misses: usize = 0,
     hit_tokens: usize = 0,
     evictions: usize = 0,
+    /// When true, entries allocate and maintain a normalized-hidden buffer for
+    /// MTP drafter seeding. Flipped on by the server once the MTP sidecar is
+    /// loaded; stays off for the normal decode-only path so non-MTP serving
+    /// pays no extra device memory.
+    track_hidden: bool = false,
 
     pub fn init(
         max_cache_tokens: usize,
@@ -360,6 +406,47 @@ pub const Cache = struct {
         self.misses += 1;
     }
 
+    /// Enable hidden-state tracking for subsequent stores and loads. Must be
+    /// called before any entry that should carry a hidden buffer is created.
+    pub fn enableHiddenTracking(self: *Cache) void {
+        self.track_hidden = true;
+    }
+
+    pub fn hiddenTrackingEnabled(self: *const Cache) bool {
+        return self.track_hidden;
+    }
+
+    /// Returns the entry's normalized-hidden buffer for `match`, or null when
+    /// hidden tracking is off or the entry has no hidden buffer.
+    pub fn entryHidden(self: *const Cache, match: Match) ?metal.Buffer {
+        if (match.index >= self.entries.items.len) return null;
+        return self.entries.items[match.index].hidden;
+    }
+
+    /// Whether `entryHidden`'s buffer holds real captured rows for `match.len`
+    /// rows. False for an allocated-but-zero buffer (e.g. a v3 file written
+    /// without hiddens). Callers that gate on real hiddens (MTP drafter
+    /// seeding) should check this rather than nullness.
+    pub fn entryHiddenValid(self: *const Cache, match: Match) bool {
+        if (match.index >= self.entries.items.len) return false;
+        return self.entries.items[match.index].hidden_valid;
+    }
+
+    /// Copy `src`'s first `match.len` hidden rows into the entry's hidden
+    /// buffer, allocating it if needed. Used by the direct-entry path which
+    /// bypasses `storePrefixFromWork`.
+    pub fn setEntryHidden(self: *Cache, device: *metal.Device, match: Match, src: metal.Buffer) !void {
+        if (match.index >= self.entries.items.len) return error.EmptyPrefix;
+        const entry = &self.entries.items[match.index];
+        try entry.ensureHiddenCapacity(device, match.len);
+        if (entry.hidden) |dst| {
+            const copy_bytes = try hiddenRowsBytes(match.len);
+            if (src.length < copy_bytes) return error.InputBufferTooSmall;
+            @memcpy(dst.slice(u8)[0..copy_bytes], src.slice(u8)[0..copy_bytes]);
+            entry.hidden_valid = true;
+        }
+    }
+
     pub fn cachedNextTokenValid(self: *const Cache, match: Match) bool {
         return self.entries.items[match.index].cached_next_token_valid;
     }
@@ -430,7 +517,10 @@ pub const Cache = struct {
 
     /// Store a computed prefix from a work state. This may evict entries and
     /// shift indexes, including `reuse_match`; callers must discard old matches
-    /// and use the returned `Match` for later cache access.
+    /// and use the returned `Match` for later cache access. When hidden
+    /// tracking is enabled and `work_hidden` is provided, its rows starting at
+    /// `work_hidden_base_rows` (length `prefix_ids.len - reuse_len`) are copied
+    /// into the entry's hidden buffer after the preserved reused prefix rows.
     pub fn storePrefixFromWork(
         self: *Cache,
         gpa: std.mem.Allocator,
@@ -438,6 +528,8 @@ pub const Cache = struct {
         prefix_ids: []const u32,
         reuse_match: ?Match,
         work_state: *const ModelState,
+        work_hidden: ?metal.Buffer,
+        work_hidden_base_rows: usize,
         next_token: ?metal.Buffer,
         pinned: bool,
     ) !Match {
@@ -455,6 +547,45 @@ pub const Cache = struct {
                 }
             } else if (reuse_len == 0) {
                 try entry.cached_state.copyPrefixFrom(work_state, prefix_ids.len);
+            }
+        }
+
+        if (self.track_hidden) {
+            // Whether the reused prefix rows in the entry are already valid.
+            // ensureHiddenCapacity preserves the old buffer's rows in-place
+            // (clamped to the old buffer size), so we only need to track
+            // validity, not re-copy here.
+            //
+            // Read validity from `entry` (match.index, adjusted) rather than
+            // reuse_match.index: ensureReservedTokenBudget can evict entries
+            // with smaller indices, shifting the reuse entry down, so the
+            // caller's reuse_match.index may be stale and point at a different
+            // entry. On the no-exact-match path (the only one current callers
+            // reach), `entry` IS the reused entry, so its flag is correct.
+            const reuse_hidden_valid = if (reuse_len != 0) entry.hidden_valid else false;
+            try entry.ensureHiddenCapacity(device, prefix_ids.len);
+            if (entry.hidden) |dst| {
+                const suffix_rows = prefix_ids.len - reuse_len;
+                if (suffix_rows != 0) {
+                    const suffix_bytes = try hiddenRowsBytes(suffix_rows);
+                    const dst_off = try hiddenRowsBytes(reuse_len);
+                    if (work_hidden) |src| {
+                        const src_off = try hiddenRowsBytes(work_hidden_base_rows);
+                        if (src.length < src_off + suffix_bytes) return error.InputBufferTooSmall;
+                        @memcpy(dst.slice(u8)[dst_off..][0..suffix_bytes], src.slice(u8)[src_off..][0..suffix_bytes]);
+                    } else {
+                        @memset(dst.slice(u8)[dst_off..][0..suffix_bytes], 0);
+                    }
+                }
+                // The buffer is valid when both halves are: the reused prefix
+                // rows (0..reuse_len) are valid iff the reused entry's hiddens
+                // were valid, and the suffix rows (reuse_len..prefix_ids.len)
+                // are valid iff they were filled from a real captured buffer
+                // (or there is no suffix). When reuse_len == 0 (fresh entry),
+                // only the suffix half matters.
+                const prefix_half_valid = (reuse_len == 0) or reuse_hidden_valid;
+                const suffix_half_valid = (suffix_rows == 0) or (work_hidden != null);
+                entry.hidden_valid = prefix_half_valid and suffix_half_valid;
             }
         }
 
@@ -482,6 +613,9 @@ pub const Cache = struct {
         if (token_count == 0 or token_count > self.max_tokens) return error.SequenceTooLong;
         var entry = try Entry.init(device, @max(token_count, self.initial_state_tokens), true);
         errdefer entry.deinit(gpa);
+        if (self.track_hidden) {
+            try entry.ensureHiddenCapacity(device, token_count);
+        }
         try entry.tokens.resize(gpa, token_count);
         entry.last_access = self.nextAccess();
         try self.entries.append(gpa, entry);
@@ -690,7 +824,8 @@ test "resident prefix index preserves descendant entries after branch removal" {
     try std.testing.expectEqual(@as(usize, 1), cache.entryCount());
     try std.testing.expectEqual(@as(usize, 4), cache.resident_tokens);
     try std.testing.expect(cache.findPrefix(&.{ 1, 2, 3, 0 }) == null);
-    try std.testing.expect(cache.containsPromptPrefix(&.{ 1, 2, 3, 4, 5 }, 3));
+    try std.testing.expect(!cache.containsPromptPrefix(&.{ 1, 2, 3, 4, 5 }, 3));
+    try std.testing.expect(cache.containsPromptPrefix(&.{ 1, 2, 3, 4, 5 }, 4));
 
     const longest = cache.findPrefix(&.{ 1, 2, 3, 4, 5 }).?;
     try std.testing.expectEqual(@as(usize, 4), longest.len);
@@ -720,6 +855,8 @@ test "resident prefix cache returns shifted match after extending and evicting e
         &.{ 1, 2, 3, 4, 5 },
         reuse,
         &work_state,
+        null,
+        0,
         next_token,
         false,
     );
@@ -754,4 +891,235 @@ test "resident prefix cache preserves pinned entries across eviction" {
     try std.testing.expect(cache.findPrefix(&.{ 1, 2, 3, 0 }) != null);
     try std.testing.expect(cache.findPrefix(&.{ 4, 5, 6, 0 }) == null);
     try std.testing.expect(cache.findPrefix(&.{ 7, 8, 9, 0 }) != null);
+}
+
+test "storePrefixFromWork marks hidden_valid true for fresh entry with real hiddens" {
+    var device = try testDevice();
+    defer device.destroy();
+
+    var cache = try Cache.init(8, 4);
+    defer cache.deinit(std.testing.allocator);
+    cache.enableHiddenTracking();
+
+    var work_state = try ModelState.initBf16FullCaches(&device, 4);
+    defer work_state.deinit();
+
+    const tokens = [_]u32{ 1, 2, 3 };
+    var work_hidden = try device.createSharedBuffer(try hiddenRowsBytes(tokens.len));
+    defer work_hidden.destroy();
+    @memset(work_hidden.slice(u8), 0xAB);
+
+    const match = try cache.storePrefixFromWork(
+        std.testing.allocator,
+        &device,
+        &tokens,
+        null,
+        &work_state,
+        work_hidden,
+        0,
+        null,
+        false,
+    );
+    try std.testing.expect(cache.entryHiddenValid(match));
+    const hidden = cache.entryHidden(match).?;
+    for (hidden.slice(u8)[0..(try hiddenRowsBytes(tokens.len))]) |b| try std.testing.expectEqual(@as(u8, 0xAB), b);
+}
+
+test "storePrefixFromWork preserves reused hidden rows and extends validity" {
+    var device = try testDevice();
+    defer device.destroy();
+
+    var cache = try Cache.init(16, 4);
+    defer cache.deinit(std.testing.allocator);
+    cache.enableHiddenTracking();
+
+    var work_state = try ModelState.initBf16FullCaches(&device, 8);
+    defer work_state.deinit();
+
+    // Seed a 3-row prefix with valid hiddens.
+    const prefix_a = [_]u32{ 1, 2, 3 };
+    var hidden_a = try device.createSharedBuffer(try hiddenRowsBytes(prefix_a.len));
+    defer hidden_a.destroy();
+    @memset(hidden_a.slice(u8), 0x11);
+    const match_a = try cache.storePrefixFromWork(
+        std.testing.allocator,
+        &device,
+        &prefix_a,
+        null,
+        &work_state,
+        hidden_a,
+        0,
+        null,
+        false,
+    );
+    try std.testing.expect(cache.entryHiddenValid(match_a));
+
+    // Extend to a 5-row prefix reusing the 3-row entry; suffix rows come from
+    // a real work_hidden buffer (rows 3..5 at base offset 3).
+    const prefix_b = [_]u32{ 1, 2, 3, 4, 5 };
+    var hidden_b = try device.createSharedBuffer(try hiddenRowsBytes(prefix_b.len));
+    defer hidden_b.destroy();
+    @memset(hidden_b.slice(u8), 0);
+    // Suffix rows 3..5 in the full-prompt buffer.
+    @memset(hidden_b.slice(u8)[try hiddenRowsBytes(3)..try hiddenRowsBytes(5)], 0x22);
+    const match_b = try cache.storePrefixFromWork(
+        std.testing.allocator,
+        &device,
+        &prefix_b,
+        match_a,
+        &work_state,
+        hidden_b,
+        3,
+        null,
+        false,
+    );
+    try std.testing.expect(cache.entryHiddenValid(match_b));
+    const hidden = cache.entryHidden(match_b).?;
+    // Reused rows 0..3 keep 0x11; suffix rows 3..5 are 0x22.
+    const row_bytes = try hiddenRowsBytes(1);
+    try std.testing.expectEqual(@as(u8, 0x11), hidden.slice(u8)[0]);
+    try std.testing.expectEqual(@as(u8, 0x11), hidden.slice(u8)[row_bytes * 2]);
+    try std.testing.expectEqual(@as(u8, 0x22), hidden.slice(u8)[row_bytes * 3]);
+    try std.testing.expectEqual(@as(u8, 0x22), hidden.slice(u8)[row_bytes * 4]);
+}
+
+test "storePrefixFromWork clears hidden_valid when suffix hiddens are absent" {
+    var device = try testDevice();
+    defer device.destroy();
+
+    var cache = try Cache.init(16, 4);
+    defer cache.deinit(std.testing.allocator);
+    cache.enableHiddenTracking();
+
+    var work_state = try ModelState.initBf16FullCaches(&device, 8);
+    defer work_state.deinit();
+
+    const prefix_a = [_]u32{ 1, 2, 3 };
+    var hidden_a = try device.createSharedBuffer(try hiddenRowsBytes(prefix_a.len));
+    defer hidden_a.destroy();
+    @memset(hidden_a.slice(u8), 0x11);
+    const match_a = try cache.storePrefixFromWork(
+        std.testing.allocator,
+        &device,
+        &prefix_a,
+        null,
+        &work_state,
+        hidden_a,
+        0,
+        null,
+        false,
+    );
+    try std.testing.expect(cache.entryHiddenValid(match_a));
+
+    // Extend with no work_hidden: suffix rows are zero-filled and the entry
+    // must not claim validity (so MTP falls back instead of using zeros).
+    const prefix_b = [_]u32{ 1, 2, 3, 4, 5 };
+    const match_b = try cache.storePrefixFromWork(
+        std.testing.allocator,
+        &device,
+        &prefix_b,
+        match_a,
+        &work_state,
+        null,
+        0,
+        null,
+        false,
+    );
+    try std.testing.expect(!cache.entryHiddenValid(match_b));
+}
+
+test "storePrefixFromWork reads reuse validity from the shifted entry, not stale reuse_match.index" {
+    // Regression: ensureReservedTokenBudget can evict a lower-index entry,
+    // shifting the reused entry down. The caller's reuse_match.index is the
+    // pre-shift value, so reading entries[reuse_match.index].hidden_valid can
+    // hit a different entry (or run off the end). The fix reads
+    // entry.hidden_valid (match.index, adjusted) instead.
+    var device = try testDevice();
+    defer device.destroy();
+
+    // max_tokens=8, initial_state_tokens=4 -> each entry reserves 4; two
+    // entries fill the budget, a capacity-growing reuse-store must evict.
+    var cache = try Cache.init(8, 4);
+    defer cache.deinit(std.testing.allocator);
+    cache.enableHiddenTracking();
+
+    var work_state = try ModelState.initBf16FullCaches(&device, 8);
+    defer work_state.deinit();
+
+    // Entry A at index 0 (3 tokens, reserves 4).
+    const prefix_a = [_]u32{ 1, 2, 3 };
+    var hidden_a = try device.createSharedBuffer(try hiddenRowsBytes(prefix_a.len));
+    defer hidden_a.destroy();
+    @memset(hidden_a.slice(u8), 0x11);
+    const match_a = try cache.storePrefixFromWork(
+        std.testing.allocator,
+        &device,
+        &prefix_a,
+        null,
+        &work_state,
+        hidden_a,
+        0,
+        null,
+        false,
+    );
+    try std.testing.expectEqual(@as(usize, 0), match_a.index);
+    try std.testing.expect(cache.entryHiddenValid(match_a));
+
+    // Entry B at index 1 (3 tokens, reserves 4) with valid hiddens.
+    const prefix_b = [_]u32{ 4, 5, 6 };
+    var hidden_b = try device.createSharedBuffer(try hiddenRowsBytes(prefix_b.len));
+    defer hidden_b.destroy();
+    @memset(hidden_b.slice(u8), 0x22);
+    const match_b = try cache.storePrefixFromWork(
+        std.testing.allocator,
+        &device,
+        &prefix_b,
+        null,
+        &work_state,
+        hidden_b,
+        0,
+        null,
+        false,
+    );
+    try std.testing.expectEqual(@as(usize, 1), match_b.index);
+    try std.testing.expect(cache.entryHiddenValid(match_b));
+    try std.testing.expectEqual(@as(usize, 8), cache.reserved_tokens);
+
+    // Reuse B (match_b.index = 1) and grow B from 3 to 5 tokens. This needs +1
+    // reserved token (capacity 4 -> 5), forcing eviction of A (index 0). B
+    // shifts from index 1 to 0; match_b.index (1) is now stale.
+    const prefix_c = [_]u32{ 4, 5, 6, 7, 8 };
+    var hidden_c = try device.createSharedBuffer(try hiddenRowsBytes(prefix_c.len));
+    defer hidden_c.destroy();
+    // Suffix rows 3..5 carry real data so the result is valid.
+    @memset(hidden_c.slice(u8), 0);
+    @memset(hidden_c.slice(u8)[try hiddenRowsBytes(3)..try hiddenRowsBytes(5)], 0x33);
+    const match_c = try cache.storePrefixFromWork(
+        std.testing.allocator,
+        &device,
+        &prefix_c,
+        match_b,
+        &work_state,
+        hidden_c,
+        3,
+        null,
+        false,
+    );
+
+    // B shifted to index 0; A was evicted; only one entry remains.
+    try std.testing.expectEqual(@as(usize, 1), cache.entryCount());
+    try std.testing.expectEqual(@as(usize, 0), match_c.index);
+    // The fix: validity is read from the shifted reuse entry (B), whose
+    // hiddens were valid, and the suffix is real, so the result is valid.
+    // The old code read entries[1] (out of range -> guard -> false) and would
+    // have reported the entry invalid.
+    try std.testing.expect(cache.entryHiddenValid(match_c));
+    // And the reused prefix rows (0..3) still carry B's 0x22 pattern.
+    const hidden = cache.entryHidden(match_c).?;
+    const row_bytes = try hiddenRowsBytes(1);
+    try std.testing.expectEqual(@as(u8, 0x22), hidden.slice(u8)[0]);
+    try std.testing.expectEqual(@as(u8, 0x22), hidden.slice(u8)[row_bytes * 2]);
+    // Suffix rows 3..5 are 0x33.
+    try std.testing.expectEqual(@as(u8, 0x33), hidden.slice(u8)[row_bytes * 3]);
+    try std.testing.expectEqual(@as(u8, 0x33), hidden.slice(u8)[row_bytes * 4]);
 }

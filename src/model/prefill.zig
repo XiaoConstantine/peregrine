@@ -12,6 +12,7 @@ const ModelState = model_mod.ModelState;
 const PrefillNextTokenOutput = model_mod.PrefillNextTokenOutput;
 const monotonicNowNs = runtime_time.monotonicNowNs;
 const msFromNs = runtime_time.msFromNs;
+const hiddenRowsBytes = model_mod.dims.hiddenRowsBytes;
 const log = std.log.scoped(.peregrine_prefill);
 
 pub const SegmentOptions = struct {
@@ -23,6 +24,13 @@ pub const SegmentOptions = struct {
     trace: bool = false,
     callback: ?DeviceModel.GeneratedTokenCallback = null,
     write_next_token: bool = true,
+    /// Optional `[end_pos - start_pos, HIDDEN]` bf16 output for the target's
+    /// normalized hidden states. Only requested when MTP hidden capture is on.
+    hidden_output: ?metal.Buffer = null,
+    /// Absolute row offset in `hidden_output` where this segment's first row
+    /// (row `start_pos`) is written. Defaults to `start_pos` so a buffer sized
+    /// for the whole prompt is filled at natural positions.
+    hidden_output_base_rows: usize = 0,
 };
 
 /// Prefill `prompt_ids[start_pos..end_pos]` and leave `next_token_output` holding
@@ -92,6 +100,27 @@ pub fn prefillSegment(
     const start_ns = traceStartNs(options.trace);
     if (finalOutputChunkUsesLayerMajorGroup(prefix != null, pos, options.prefix_len)) {
         try forwardGroup(model, device, queue, prompt_ids, state, prefix, pos, options.end_pos, prepare_policy_token_count, options, next_token_output);
+    } else if (options.hidden_output) |out| {
+        // No-prefix short-prompt tail: capture hiddens via the hidden-aware
+        // next-token path, then copy into the segment buffer at this group's
+        // base offset.
+        const tail_rows = options.end_pos - pos;
+        const tail_bytes = try hiddenRowsBytes(tail_rows);
+        var tmp = try device.createPrivateBuffer(tail_bytes);
+        defer tmp.destroy();
+        try model.forwardPrefillBatchNextTokenAndHiddenWithPrefix(
+            device,
+            queue,
+            final_chunk,
+            try u32Cast(pos - options.prefix_len),
+            try u32Cast(pos),
+            state,
+            prefix,
+            next_token_output,
+            tmp,
+        );
+        const base_bytes = try hiddenRowsBytes(options.hidden_output_base_rows + (pos - options.start_pos));
+        try queue.copyBuffer(tmp, 0, out, base_bytes, tail_bytes);
     } else {
         try model.forwardPrefillBatchNextTokenWithPrefix(
             device,
@@ -121,6 +150,11 @@ fn forwardGroup(
     options: SegmentOptions,
     next_token_output: ?PrefillNextTokenOutput,
 ) !void {
+    const hidden_output = if (options.hidden_output) |buf| buf else null;
+    const hidden_base_rows: usize = if (hidden_output != null)
+        options.hidden_output_base_rows + (pos - options.start_pos)
+    else
+        0;
     try model.forwardPrefillBatchGroupWithPrefix(
         device,
         queue,
@@ -133,6 +167,8 @@ fn forwardGroup(
         prefix,
         options.trace,
         next_token_output,
+        hidden_output,
+        hidden_base_rows,
     );
 }
 

@@ -13,7 +13,7 @@ const checked_math = @import("../runtime/checked_math.zig");
 const runtime_time = @import("../runtime/time.zig");
 const safetensors = @import("safetensors.zig");
 const decoder_layer = @import("decoder_layer.zig");
-const dims = @import("dims.zig");
+pub const dims = @import("dims.zig");
 const block_attn = @import("block_attn.zig");
 const block_linear = @import("block_linear.zig");
 const block_mlp = @import("block_mlp.zig");
@@ -26,7 +26,7 @@ const Q4Linear = linear_q4.Q4Linear;
 const argmax = @import("argmax.zig");
 
 pub const NUM_LAYERS = state_mod.NUM_LAYERS;
-const HIDDEN = dims.hidden;
+pub const HIDDEN = dims.hidden;
 const EPS = dims.rmsnorm_eps;
 pub const MAX_CONTEXT_TOKENS = state_mod.MAX_CONTEXT_TOKENS;
 pub const DEFAULT_BATCHED_PREFILL_CHUNK_TOKENS = 1600;
@@ -35,7 +35,7 @@ pub const DEFAULT_BATCHED_PREFILL_CHUNK_GROUP_SIZE = 10;
 pub const MAX_BATCHED_PREFILL_CHUNK_GROUP_SIZE = DEFAULT_BATCHED_PREFILL_CHUNK_GROUP_SIZE;
 pub const FullCacheDType = state_mod.FullCacheDType;
 pub const ModelState = state_mod.ModelState;
-const BF16_BYTES = dims.bf16_bytes;
+pub const BF16_BYTES = dims.bf16_bytes;
 const BF16_RMSNORM_THREADS = dims.bf16_rmsnorm_threads;
 const QWEN35_PREPARED_MLP_DENSE_RHS_MIN_TOKENS: usize = 3840;
 const monotonicNowNs = runtime_time.monotonicNowNs;
@@ -86,7 +86,12 @@ const LayerMajorPrepareMlpDenseRhs = struct {
     }
 };
 
-fn hiddenMatrixBytes(token_count: u32, bytes_per_value: usize) !usize {
+const HiddenPair = struct {
+    first: metal.Buffer,
+    second: metal.Buffer,
+};
+
+fn hiddenMatrixBytes(token_count: usize, bytes_per_value: usize) !usize {
     return checked_math.product(.{ token_count, HIDDEN, bytes_per_value });
 }
 
@@ -536,7 +541,9 @@ pub const DeviceModel = struct {
     embed_bf16_pipe: metal.Pipeline,
     embed_many_bf16_pipe: metal.Pipeline,
     copy_row_bf16_pipe: metal.Pipeline,
+    write_row_bf16_pipe: metal.Pipeline,
     lm_head_argmax_partial_pipe: metal.Pipeline,
+    lm_head_argmax2_partial_pipe: metal.Pipeline,
     argmax_pairs_pipe: metal.Pipeline,
 
     embed_weight: metal.Buffer,
@@ -581,8 +588,12 @@ pub const DeviceModel = struct {
         errdefer embed_many_bf16_pipe.destroy();
         var copy_row_bf16_pipe = try device.createPipeline(library, "copy_row_bf16");
         errdefer copy_row_bf16_pipe.destroy();
+        var write_row_bf16_pipe = try device.createPipeline(library, "write_row_bf16");
+        errdefer write_row_bf16_pipe.destroy();
         var lm_head_argmax_partial_pipe = try device.createPipeline(library, "linear_vec_q4_affine_group64_qmv_fast_argmax_partial_bf16");
         errdefer lm_head_argmax_partial_pipe.destroy();
+        var lm_head_argmax2_partial_pipe = try device.createPipeline(library, "linear_vec_q4_affine_group64_qmv_fast_argmax2_partial_bf16");
+        errdefer lm_head_argmax2_partial_pipe.destroy();
         var argmax_pairs_pipe = try device.createPipeline(library, "argmax_pairs_f32_u32");
         errdefer argmax_pairs_pipe.destroy();
 
@@ -625,7 +636,9 @@ pub const DeviceModel = struct {
             .embed_bf16_pipe = embed_bf16_pipe,
             .embed_many_bf16_pipe = embed_many_bf16_pipe,
             .copy_row_bf16_pipe = copy_row_bf16_pipe,
+            .write_row_bf16_pipe = write_row_bf16_pipe,
             .lm_head_argmax_partial_pipe = lm_head_argmax_partial_pipe,
+            .lm_head_argmax2_partial_pipe = lm_head_argmax2_partial_pipe,
             .argmax_pairs_pipe = argmax_pairs_pipe,
             .embed_weight = embed_weight,
             .embed_scales = embed_scales,
@@ -659,7 +672,9 @@ pub const DeviceModel = struct {
         self.eps_buf.destroy();
         self.rows1_buf.destroy();
         self.argmax_pairs_pipe.destroy();
+        self.lm_head_argmax2_partial_pipe.destroy();
         self.lm_head_argmax_partial_pipe.destroy();
+        self.write_row_bf16_pipe.destroy();
         self.copy_row_bf16_pipe.destroy();
         self.embed_many_bf16_pipe.destroy();
         self.embed_bf16_pipe.destroy();
@@ -701,6 +716,65 @@ pub const DeviceModel = struct {
         return src;
     }
 
+    fn encodeStack2Bf16(
+        self: *DeviceModel,
+        ws: *metal.Workspace,
+        token_ids: [2]u32,
+        start_cache_pos: u32,
+        start_rope_pos: u32,
+        start_seq_len: u32,
+        state: *ModelState,
+        prefix: ?PrefixState,
+    ) !HiddenPair {
+        try requirePrefixDType(prefix, .bf16);
+        for (token_ids) |token_id| {
+            if (token_id >= self.vocab) return error.InvalidTokenId;
+        }
+
+        const hidden_bytes = try checked_math.product(.{ HIDDEN, BF16_BYTES });
+        const a0 = try ws.scratch(hidden_bytes);
+        const a1 = try ws.scratch(hidden_bytes);
+        const b0 = try ws.scratch(hidden_bytes);
+        const b1 = try ws.scratch(hidden_bytes);
+
+        const tok0_buf = try ws.u32buf(token_ids[0]);
+        const tok1_buf = try ws.u32buf(token_ids[1]);
+        try ws.cmd.dispatch1D(self.embed_bf16_pipe, &.{ self.embed_weight, self.embed_scales, self.embed_biases, a0, tok0_buf, self.hidden_buf }, HIDDEN);
+        try ws.cmd.dispatch1D(self.embed_bf16_pipe, &.{ self.embed_weight, self.embed_scales, self.embed_biases, a1, tok1_buf, self.hidden_buf }, HIDDEN);
+
+        var src0 = a0;
+        var src1 = a1;
+        var dst0 = b0;
+        var dst1 = b1;
+        for (0..NUM_LAYERS) |i| {
+            ws.barrier();
+            const prefix_layer = if (prefix) |pref| &pref.state.layers[i] else null;
+            const prefix_len: u32 = if (prefix) |pref| pref.len else 0;
+            try self.layers[i].decodeStep2Bf16(
+                ws,
+                self.pipes,
+                src0,
+                src1,
+                &state.layers[i],
+                start_cache_pos,
+                start_rope_pos,
+                start_seq_len,
+                prefix_layer,
+                prefix_len,
+                dst0,
+                dst1,
+            );
+            const tmp0 = src0;
+            const tmp1 = src1;
+            src0 = dst0;
+            src1 = dst1;
+            dst0 = tmp0;
+            dst1 = tmp1;
+        }
+        ws.barrier();
+        return .{ .first = src0, .second = src1 };
+    }
+
     fn encodeNextTokenBf16(
         self: *DeviceModel,
         ws: *metal.Workspace,
@@ -712,11 +786,26 @@ pub const DeviceModel = struct {
         prefix: ?PrefixState,
         output_token: metal.Buffer,
     ) !void {
+        try self.encodeNextTokenBf16AndMaybeHidden(ws, token_id, cache_pos, rope_pos, seq_len, state, prefix, output_token, null);
+    }
+
+    fn encodeNextTokenBf16AndMaybeHidden(
+        self: *DeviceModel,
+        ws: *metal.Workspace,
+        token_id: u32,
+        cache_pos: u32,
+        rope_pos: u32,
+        seq_len: u32,
+        state: *ModelState,
+        prefix: ?PrefixState,
+        output_token: metal.Buffer,
+        output_normalized_hidden_bf16: ?metal.Buffer,
+    ) !void {
         try state.requireFullCacheDType(.bf16);
         if (cache_pos >= state.max_seq) return error.SequenceTooLong;
         if (token_id >= self.vocab) return error.InvalidTokenId;
         const src = try self.encodeStackBf16(ws, token_id, cache_pos, rope_pos, seq_len, state, prefix);
-        try self.encodeOneTokenArgmaxTailBf16(ws, src, output_token);
+        try self.encodeOneTokenArgmaxTailBf16(ws, src, output_token, output_normalized_hidden_bf16);
     }
 
     pub fn encodeEmbeddingBatchBf16(
@@ -750,6 +839,8 @@ pub const DeviceModel = struct {
         prefix: ?PrefixState,
         trace: bool,
         next_token_output: ?PrefillNextTokenOutput,
+        normalized_hidden_output: ?metal.Buffer,
+        normalized_hidden_output_base_rows: usize,
     ) !void {
         if (token_ids.len == 0) return;
         try state.requireFullCacheDType(.bf16);
@@ -759,6 +850,10 @@ pub const DeviceModel = struct {
         if (chunk_count == 0 or chunk_count > MAX_BATCHED_PREFILL_CHUNK_GROUP_SIZE) return error.InvalidPrefillChunkGroup;
         const end_cache_pos = std.math.add(usize, @as(usize, start_cache_pos), token_ids.len) catch return error.SequenceTooLong;
         if (end_cache_pos > state.max_seq) return error.SequenceTooLong;
+        if (normalized_hidden_output) |out| {
+            const need = try hiddenMatrixBytes(std.math.cast(u32, token_ids.len) orelse return error.SequenceTooLong, BF16_BYTES);
+            if (out.length < need) return error.OutputBufferTooSmall;
+        }
         for (token_ids) |token_id| {
             if (token_id >= self.vocab) return error.InvalidTokenId;
         }
@@ -783,7 +878,21 @@ pub const DeviceModel = struct {
             pos = chunk_end;
         }
 
-        if (made_token_bufs > 1 or (next_token_output != null and prefix == null and start_cache_pos != 0)) {
+        if (made_token_bufs > 1 or (next_token_output != null and prefix == null and start_cache_pos != 0) or normalized_hidden_output != null) {
+            var hidden_bufs: [MAX_BATCHED_PREFILL_CHUNK_GROUP_SIZE]metal.Buffer = undefined;
+            var hidden_slice: ?[]metal.Buffer = null;
+            var made_hidden_bufs: usize = 0;
+            defer if (hidden_slice != null) prefill_deferred.destroyBuffers(hidden_bufs[0..made_hidden_bufs]);
+            if (normalized_hidden_output != null) {
+                for (token_counts[0..made_token_bufs], 0..) |count, i| {
+                    const bytes = try hiddenMatrixBytes(count, BF16_BYTES);
+                    var buf = try device.createPrivateBuffer(bytes);
+                    errdefer buf.destroy();
+                    hidden_bufs[i] = buf;
+                    made_hidden_bufs += 1;
+                }
+                hidden_slice = hidden_bufs[0..made_token_bufs];
+            }
             try self.forwardPrefillBatchGroupLayerMajorCacheOnly(
                 device,
                 queue,
@@ -797,7 +906,16 @@ pub const DeviceModel = struct {
                 prefix,
                 trace,
                 next_token_output,
+                hidden_slice,
             );
+            if (normalized_hidden_output) |out| {
+                for (token_offsets[0..made_token_bufs], 0..) |off, i| {
+                    const off_rows = normalized_hidden_output_base_rows + off;
+                    const off_bytes = try hiddenMatrixBytes(off_rows, BF16_BYTES);
+                    const len_bytes = try hiddenMatrixBytes(token_counts[i], BF16_BYTES);
+                    try queue.copyBuffer(hidden_bufs[i], 0, out, off_bytes, len_bytes);
+                }
+            }
             return;
         }
 
@@ -827,6 +945,7 @@ pub const DeviceModel = struct {
         prefix: ?PrefixState,
         trace: bool,
         next_token_output: ?PrefillNextTokenOutput,
+        normalized_hidden_outputs: ?[]const metal.Buffer,
     ) !void {
         if (token_ids_bufs.len == 0 or
             token_ids_bufs.len != token_counts.len or
@@ -834,6 +953,9 @@ pub const DeviceModel = struct {
             token_ids_bufs.len > MAX_BATCHED_PREFILL_CHUNK_GROUP_SIZE)
         {
             return error.InvalidPrefillChunkGroup;
+        }
+        if (normalized_hidden_outputs) |outputs| {
+            if (outputs.len != token_ids_bufs.len) return error.InvalidPrefillChunkGroup;
         }
 
         const group_token_count = try prefillGroupTokenCount(token_counts);
@@ -925,6 +1047,16 @@ pub const DeviceModel = struct {
                     };
                 }
             }
+            if (normalized_hidden_outputs) |outputs| {
+                if (layer_index + 1 == NUM_LAYERS) {
+                    for (0..token_ids_bufs.len) |chunk_index| {
+                        self.encodeFinalNormRowsBf16(&ws, dst[chunk_index], token_counts[chunk_index], outputs[chunk_index]) catch |e| {
+                            ws.abort();
+                            return e;
+                        };
+                    }
+                }
+            }
             pending[pool_index] = ws.commitPooled();
             pending_layer_index[pool_index] = layer_index;
             if (pending_full_attention_scratch[pool_index]) |*scratch| {
@@ -958,6 +1090,58 @@ pub const DeviceModel = struct {
         }
         try waitLayerMajorPendingFinal(trace, &pending, &pending_layer_index, &pending_full_attention_scratch);
         pending_prepared_rhs.destroyAll();
+    }
+
+    pub fn forwardPrefillBatchHiddenChunkWithPrefix(
+        self: *DeviceModel,
+        device: *metal.Device,
+        queue: *metal.Queue,
+        token_ids: []const u32,
+        start_cache_pos: u32,
+        start_rope_pos: u32,
+        prepare_policy_token_count: usize,
+        state: *ModelState,
+        prefix: ?PrefixState,
+        trace: bool,
+        next_token_output: ?PrefillNextTokenOutput,
+        normalized_hidden_output: metal.Buffer,
+    ) !void {
+        if (token_ids.len == 0) return;
+        try state.requireFullCacheDType(.bf16);
+        try requirePrefixDType(prefix, .bf16);
+        if (token_ids.len > MAX_BATCHED_PREFILL_CHUNK_TOKENS) return error.PrefillChunkTooLarge;
+        const token_count = std.math.cast(u32, token_ids.len) orelse return error.SequenceTooLong;
+        const end_cache_pos = std.math.add(usize, @as(usize, start_cache_pos), token_ids.len) catch return error.SequenceTooLong;
+        if (end_cache_pos > state.max_seq) return error.SequenceTooLong;
+        if (normalized_hidden_output.length < try hiddenMatrixBytes(token_count, BF16_BYTES)) return error.OutputBufferTooSmall;
+        for (token_ids) |token_id| {
+            if (token_id >= self.vocab) return error.InvalidTokenId;
+        }
+
+        const token_bytes = std.math.mul(usize, token_ids.len, @sizeOf(u32)) catch return error.ContextSizeOverflow;
+        var token_ids_buf = try device.createSharedBuffer(token_bytes);
+        defer token_ids_buf.destroy();
+        @memcpy(token_ids_buf.slice(u32), token_ids);
+
+        var token_bufs = [_]metal.Buffer{token_ids_buf};
+        var token_counts = [_]u32{token_count};
+        var token_offsets = [_]u32{0};
+        var hidden_outputs = [_]metal.Buffer{normalized_hidden_output};
+        try self.forwardPrefillBatchGroupLayerMajorCacheOnly(
+            device,
+            queue,
+            token_bufs[0..],
+            token_counts[0..],
+            token_offsets[0..],
+            start_cache_pos,
+            start_rope_pos,
+            prepare_policy_token_count,
+            state,
+            prefix,
+            trace,
+            next_token_output,
+            hidden_outputs[0..],
+        );
     }
 
     fn createLayerMajorHiddenBuffers(
@@ -1053,6 +1237,73 @@ pub const DeviceModel = struct {
         try ws.commitAndWait();
     }
 
+    pub fn forwardPrefillBatchNextTokenAndHiddenWithPrefix(
+        self: *DeviceModel,
+        device: *metal.Device,
+        queue: *metal.Queue,
+        token_ids: []const u32,
+        start_cache_pos: u32,
+        start_rope_pos: u32,
+        state: *ModelState,
+        prefix: ?PrefixState,
+        next_token_output: PrefillNextTokenOutput,
+        normalized_hidden_output: metal.Buffer,
+    ) !void {
+        if (token_ids.len == 0) return;
+        try state.requireFullCacheDType(.bf16);
+        try requirePrefixDType(prefix, .bf16);
+        if (token_ids.len > MAX_BATCHED_PREFILL_CHUNK_TOKENS) return error.PrefillChunkTooLarge;
+        const token_count = std.math.cast(u32, token_ids.len) orelse return error.SequenceTooLong;
+        if (normalized_hidden_output.length < try hiddenMatrixBytes(token_count, BF16_BYTES)) return error.OutputBufferTooSmall;
+        const end_cache_pos = std.math.add(usize, @as(usize, start_cache_pos), token_ids.len) catch return error.SequenceTooLong;
+        if (end_cache_pos > state.max_seq) return error.SequenceTooLong;
+        for (token_ids) |token_id| {
+            if (token_id >= self.vocab) return error.InvalidTokenId;
+        }
+
+        const token_bytes = std.math.mul(usize, token_ids.len, @sizeOf(u32)) catch return error.ContextSizeOverflow;
+        var token_ids_buf = try device.createSharedBuffer(token_bytes);
+        defer token_ids_buf.destroy();
+        @memcpy(token_ids_buf.slice(u32), token_ids);
+
+        var ws = try metal.Workspace.beginWithScratchPool(device, queue, &self.prefill_scratch_pool);
+        var committed = false;
+        errdefer if (!committed) ws.abort();
+
+        const hidden = try self.encodePrefillBatchHidden(&ws, token_ids_buf, token_count, start_cache_pos, start_rope_pos, state, prefix);
+        try self.encodeFinalNormRowsBf16(&ws, hidden, token_count, normalized_hidden_output);
+
+        const hidden_bytes = try checked_math.product(.{ HIDDEN, BF16_BYTES });
+        const last_hidden = try ws.scratch(hidden_bytes);
+        const last_row = try ws.u32buf(token_count - 1);
+        try ws.cmd.dispatch1D(self.copy_row_bf16_pipe, &.{ normalized_hidden_output, last_hidden, last_row, self.hidden_buf }, HIDDEN);
+        try self.encodeArgmaxFromNormalizedHiddenBf16(&ws, last_hidden, next_token_output, false);
+        committed = true;
+        try ws.commitAndWait();
+    }
+
+    pub fn encodeFinalNormRowsBf16(
+        self: *DeviceModel,
+        ws: *metal.Workspace,
+        hidden_bf16: metal.Buffer,
+        token_count: u32,
+        output_bf16: metal.Buffer,
+    ) !void {
+        if (token_count == 0) return error.EmptyInput;
+        const hidden_bytes = try hiddenMatrixBytes(token_count, BF16_BYTES);
+        if (hidden_bf16.length < hidden_bytes) return error.InputBufferTooSmall;
+        if (output_bf16.length < hidden_bytes) return error.OutputBufferTooSmall;
+
+        const rows_buf = try ws.u32buf(token_count);
+        const threads_buf = try ws.u32buf(BF16_RMSNORM_THREADS);
+        try ws.cmd.dispatch1DWithThreadgroup(
+            self.pipes.core.rmsnorm_bf16,
+            &.{ hidden_bf16, self.final_norm, output_bf16, self.hidden_buf, rows_buf, self.eps_buf, threads_buf },
+            @as(usize, token_count) * @as(usize, BF16_RMSNORM_THREADS),
+            BF16_RMSNORM_THREADS,
+        );
+    }
+
     fn encodePrefillArgmaxTailBf16(
         self: *DeviceModel,
         ws: *metal.Workspace,
@@ -1069,7 +1320,7 @@ pub const DeviceModel = struct {
 
         const last_row = try ws.u32buf(token_count - 1);
         try ws.cmd.dispatch1D(self.copy_row_bf16_pipe, &.{ hidden, last_hidden, last_row, self.hidden_buf }, HIDDEN);
-        try self.encodeArgmaxFromHiddenBf16(ws, last_hidden, output_token, false);
+        try self.encodeArgmaxFromHiddenBf16(ws, last_hidden, output_token, false, null);
     }
 
     fn encodeOneTokenArgmaxTailBf16(
@@ -1077,11 +1328,15 @@ pub const DeviceModel = struct {
         ws: *metal.Workspace,
         hidden_bf16: metal.Buffer,
         output_token: metal.Buffer,
+        output_normalized_hidden_bf16: ?metal.Buffer,
     ) !void {
         const hidden_bytes = try checked_math.product(.{ HIDDEN, BF16_BYTES });
         if (hidden_bf16.length < hidden_bytes) return error.InputBufferTooSmall;
         if (output_token.length < @sizeOf(u32)) return error.OutputBufferTooSmall;
-        try self.encodeArgmaxFromHiddenBf16(ws, hidden_bf16, output_token, true);
+        if (output_normalized_hidden_bf16) |out| {
+            if (out.length < hidden_bytes) return error.OutputBufferTooSmall;
+        }
+        try self.encodeArgmaxFromHiddenBf16(ws, hidden_bf16, output_token, true, output_normalized_hidden_bf16);
     }
 
     fn encodeArgmaxFromHiddenBf16(
@@ -1090,14 +1345,10 @@ pub const DeviceModel = struct {
         hidden_bf16: metal.Buffer,
         output_token: metal.Buffer,
         with_serial_barriers: bool,
+        output_normalized_hidden_bf16: ?metal.Buffer,
     ) !void {
         const hidden_bytes = try checked_math.product(.{ HIDDEN, BF16_BYTES });
         const final_normed = try ws.scratch(hidden_bytes);
-        const partial_count = try argmax.q4AffineFastArgmaxPartialCount(self.vocab);
-        const partial_values_bytes = try checked_math.product(.{ partial_count, @sizeOf(f32) });
-        const partial_indices_bytes = try checked_math.product(.{ partial_count, @sizeOf(u32) });
-        const partial_values = try ws.scratch(partial_values_bytes);
-        const partial_indices = try ws.scratch(partial_indices_bytes);
 
         const threads_buf = try ws.u32buf(BF16_RMSNORM_THREADS);
         try ws.cmd.dispatch1DWithThreadgroup(
@@ -1107,9 +1358,96 @@ pub const DeviceModel = struct {
             BF16_RMSNORM_THREADS,
         );
         if (with_serial_barriers) ws.barrier();
-        try self.lm_head.encodeBf16ArgmaxPartial(ws, self.lm_head_argmax_partial_pipe, final_normed, partial_values, partial_indices);
+        if (output_normalized_hidden_bf16) |out| {
+            const row0 = try ws.u32buf(0);
+            try ws.cmd.dispatch1D(self.copy_row_bf16_pipe, &.{ final_normed, out, row0, self.hidden_buf }, HIDDEN);
+            if (with_serial_barriers) ws.barrier();
+        }
+        try self.encodeArgmaxFromNormalizedHiddenBf16(ws, final_normed, output_token, with_serial_barriers);
+    }
+
+    pub fn encodeArgmaxFromNormalizedHiddenBf16(
+        self: *DeviceModel,
+        ws: *metal.Workspace,
+        normalized_hidden_bf16: metal.Buffer,
+        output_token: metal.Buffer,
+        with_serial_barriers: bool,
+    ) !void {
+        const hidden_bytes = try checked_math.product(.{ HIDDEN, BF16_BYTES });
+        if (normalized_hidden_bf16.length < hidden_bytes) return error.InputBufferTooSmall;
+        if (output_token.length < @sizeOf(u32)) return error.OutputBufferTooSmall;
+        const partial_count = try argmax.q4AffineFastArgmaxPartialCount(self.vocab);
+        const partial_values_bytes = try checked_math.product(.{ partial_count, @sizeOf(f32) });
+        const partial_indices_bytes = try checked_math.product(.{ partial_count, @sizeOf(u32) });
+        const partial_values = try ws.scratch(partial_values_bytes);
+        const partial_indices = try ws.scratch(partial_indices_bytes);
+
+        try self.lm_head.encodeBf16ArgmaxPartial(ws, self.lm_head_argmax_partial_pipe, normalized_hidden_bf16, partial_values, partial_indices);
         if (with_serial_barriers) ws.barrier();
         try argmax.encodePairsF32U32(ws, self.argmax_pairs_pipe, partial_values, partial_indices, output_token, partial_count);
+    }
+
+    fn encodeArgmaxFromTwoHiddenBf16(
+        self: *DeviceModel,
+        ws: *metal.Workspace,
+        hidden0_bf16: metal.Buffer,
+        hidden1_bf16: metal.Buffer,
+        output0_token: metal.Buffer,
+        output1_token: metal.Buffer,
+        output_normalized_hidden_bf16: ?metal.Buffer,
+    ) !void {
+        const hidden_bytes = try checked_math.product(.{ HIDDEN, BF16_BYTES });
+        if (hidden0_bf16.length < hidden_bytes or hidden1_bf16.length < hidden_bytes) return error.InputBufferTooSmall;
+        if (output0_token.length < @sizeOf(u32) or output1_token.length < @sizeOf(u32)) return error.OutputBufferTooSmall;
+        if (output_normalized_hidden_bf16) |out| {
+            if (out.length < try hiddenMatrixBytes(2, BF16_BYTES)) return error.OutputBufferTooSmall;
+        }
+
+        const norm0 = try ws.scratch(hidden_bytes);
+        const norm1 = try ws.scratch(hidden_bytes);
+        const threads_buf = try ws.u32buf(BF16_RMSNORM_THREADS);
+        try ws.cmd.dispatch1DWithThreadgroup(
+            self.pipes.core.rmsnorm_bf16,
+            &.{ hidden0_bf16, self.final_norm, norm0, self.hidden_buf, self.rows1_buf, self.eps_buf, threads_buf },
+            BF16_RMSNORM_THREADS,
+            BF16_RMSNORM_THREADS,
+        );
+        try ws.cmd.dispatch1DWithThreadgroup(
+            self.pipes.core.rmsnorm_bf16,
+            &.{ hidden1_bf16, self.final_norm, norm1, self.hidden_buf, self.rows1_buf, self.eps_buf, threads_buf },
+            BF16_RMSNORM_THREADS,
+            BF16_RMSNORM_THREADS,
+        );
+        ws.barrier();
+        if (output_normalized_hidden_bf16) |out| {
+            const row0 = try ws.u32buf(0);
+            const row1 = try ws.u32buf(1);
+            try ws.cmd.dispatch1D(self.write_row_bf16_pipe, &.{ norm0, out, row0, self.hidden_buf }, HIDDEN);
+            try ws.cmd.dispatch1D(self.write_row_bf16_pipe, &.{ norm1, out, row1, self.hidden_buf }, HIDDEN);
+            ws.barrier();
+        }
+
+        const partial_count = try argmax.q4AffineFastArgmaxPartialCount(self.vocab);
+        const partial_values_bytes = try checked_math.product(.{ partial_count, @sizeOf(f32) });
+        const partial_indices_bytes = try checked_math.product(.{ partial_count, @sizeOf(u32) });
+        const partial_values0 = try ws.scratch(partial_values_bytes);
+        const partial_indices0 = try ws.scratch(partial_indices_bytes);
+        const partial_values1 = try ws.scratch(partial_values_bytes);
+        const partial_indices1 = try ws.scratch(partial_indices_bytes);
+
+        try self.lm_head.encodeBf16ArgmaxPartial2(
+            ws,
+            self.lm_head_argmax2_partial_pipe,
+            norm0,
+            norm1,
+            partial_values0,
+            partial_indices0,
+            partial_values1,
+            partial_indices1,
+        );
+        ws.barrier();
+        try argmax.encodePairsF32U32(ws, self.argmax_pairs_pipe, partial_values0, partial_indices0, output0_token, partial_count);
+        try argmax.encodePairsF32U32(ws, self.argmax_pairs_pipe, partial_values1, partial_indices1, output1_token, partial_count);
     }
 
     fn encodePrefillBatchCacheOnly(
@@ -1194,6 +1532,35 @@ pub const DeviceModel = struct {
         return ws;
     }
 
+    fn encodeNextTokenWorkspaceAndMaybeHidden(
+        self: *DeviceModel,
+        device: *metal.Device,
+        queue: *metal.Queue,
+        token_id: u32,
+        cache_pos: u32,
+        rope_pos: u32,
+        seq_len: u32,
+        state: *ModelState,
+        prefix: ?PrefixState,
+        output_token: metal.Buffer,
+        output_normalized_hidden_bf16: ?metal.Buffer,
+    ) !metal.Workspace {
+        var ws = try metal.Workspace.beginConcurrentWithScratchPool(device, queue, &self.scratch_pool);
+        errdefer ws.abort();
+        try self.encodeNextTokenBf16AndMaybeHidden(
+            &ws,
+            token_id,
+            cache_pos,
+            rope_pos,
+            seq_len,
+            state,
+            prefix,
+            output_token,
+            output_normalized_hidden_bf16,
+        );
+        return ws;
+    }
+
     pub fn forwardNextTokenBf16WithPrefix(
         self: *DeviceModel,
         device: *metal.Device,
@@ -1226,6 +1593,70 @@ pub const DeviceModel = struct {
     ) !?u64 {
         var ws = try self.encodeNextTokenWorkspace(device, queue, token_id, cache_pos, rope_pos, seq_len, state, prefix, output_token);
         var pending = ws.commitPooled();
+        return try pending.waitProfile();
+    }
+
+    pub fn forwardNextTokenBf16WithPrefixAndHiddenProfiled(
+        self: *DeviceModel,
+        device: *metal.Device,
+        queue: *metal.Queue,
+        token_id: u32,
+        cache_pos: u32,
+        rope_pos: u32,
+        seq_len: u32,
+        state: *ModelState,
+        prefix: ?PrefixState,
+        output_token: metal.Buffer,
+        output_normalized_hidden_bf16: metal.Buffer,
+    ) !?u64 {
+        var ws = try self.encodeNextTokenWorkspaceAndMaybeHidden(
+            device,
+            queue,
+            token_id,
+            cache_pos,
+            rope_pos,
+            seq_len,
+            state,
+            prefix,
+            output_token,
+            output_normalized_hidden_bf16,
+        );
+        var pending = ws.commitPooled();
+        return try pending.waitProfile();
+    }
+
+    pub fn forwardTwoTokenDecodeVerifierBf16WithPrefixProfiled(
+        self: *DeviceModel,
+        device: *metal.Device,
+        queue: *metal.Queue,
+        token_ids: [2]u32,
+        start_cache_pos: u32,
+        start_rope_pos: u32,
+        start_seq_len: u32,
+        state: *ModelState,
+        prefix: ?PrefixState,
+        verify_token_output: metal.Buffer,
+        bonus_token_output: metal.Buffer,
+        normalized_hidden_output: ?metal.Buffer,
+    ) !?u64 {
+        try state.requireFullCacheDType(.bf16);
+        try requirePrefixDType(prefix, .bf16);
+        if (verify_token_output.length < @sizeOf(u32) or bonus_token_output.length < @sizeOf(u32)) return error.OutputBufferTooSmall;
+        const end_cache_pos = std.math.add(usize, @as(usize, start_cache_pos), 2) catch return error.SequenceTooLong;
+        if (end_cache_pos > state.max_seq) return error.SequenceTooLong;
+        for (token_ids) |token_id| {
+            if (token_id >= self.vocab) return error.InvalidTokenId;
+        }
+
+        var ws = try metal.Workspace.beginConcurrentWithScratchPool(device, queue, &self.scratch_pool);
+        var committed = false;
+        errdefer if (!committed) ws.abort();
+
+        const hidden = try self.encodeStack2Bf16(&ws, token_ids, start_cache_pos, start_rope_pos, start_seq_len, state, prefix);
+        try self.encodeArgmaxFromTwoHiddenBf16(&ws, hidden.first, hidden.second, verify_token_output, bonus_token_output, normalized_hidden_output);
+
+        var pending = ws.commitPooled();
+        committed = true;
         return try pending.waitProfile();
     }
 };

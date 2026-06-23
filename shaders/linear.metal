@@ -254,6 +254,171 @@ kernel void linear_vec_q4_affine_group64_qmv_fast_argmax_partial_bf16(
     }
 }
 
+METAL_FUNC void q4_affine_group64_qmv_fast_compute4x2_bf16(
+    device const bfloat *input0,
+    device const bfloat *input1,
+    device const uint *weight,
+    device const ushort *scales,
+    device const ushort *biases,
+    uint out_base,
+    uint in_dim,
+    ushort simd_lane_id,
+    thread float *result0,
+    thread float *result1
+) {
+    constexpr uint values_per_thread = 16;
+    const uint bytes_per_row = in_dim / 2;
+    const uint group_count = in_dim / 64;
+    const uint lane = uint(simd_lane_id);
+    const device uchar *weight_bytes = reinterpret_cast<const device uchar *>(weight);
+
+    for (uint row = 0; row < Q4_AFFINE_FAST_RESULTS_PER_SIMDGROUP; row += 1) {
+        result0[row] = 0.0f;
+        result1[row] = 0.0f;
+    }
+
+    for (uint k = 0; k < in_dim; k += values_per_thread * LINEAR_VEC_CACHED_INPUT_SIMDGROUP_WIDTH) {
+        const uint input_base = k + lane * values_per_thread;
+        float x0_thread[values_per_thread];
+        float x1_thread[values_per_thread];
+        float input0_sum = 0.0f;
+        float input1_sum = 0.0f;
+        for (uint index = 0; index < values_per_thread; index += 4) {
+            const float x00 = float(input0[input_base + index + 0]);
+            const float x01 = float(input0[input_base + index + 1]);
+            const float x02 = float(input0[input_base + index + 2]);
+            const float x03 = float(input0[input_base + index + 3]);
+            const float x10 = float(input1[input_base + index + 0]);
+            const float x11 = float(input1[input_base + index + 1]);
+            const float x12 = float(input1[input_base + index + 2]);
+            const float x13 = float(input1[input_base + index + 3]);
+            input0_sum += x00 + x01 + x02 + x03;
+            input1_sum += x10 + x11 + x12 + x13;
+            x0_thread[index + 0] = x00;
+            x0_thread[index + 1] = x01 / 16.0f;
+            x0_thread[index + 2] = x02 / 256.0f;
+            x0_thread[index + 3] = x03 / 4096.0f;
+            x1_thread[index + 0] = x10;
+            x1_thread[index + 1] = x11 / 16.0f;
+            x1_thread[index + 2] = x12 / 256.0f;
+            x1_thread[index + 3] = x13 / 4096.0f;
+        }
+
+        const uint k_byte_offset = k / 2 + lane * 8;
+        const uint group_index = k / 64 + lane / 4;
+        for (uint row = 0; row < Q4_AFFINE_FAST_RESULTS_PER_SIMDGROUP; row += 1) {
+            const uint out_index = out_base + row;
+            const uint weight_base = out_index * bytes_per_row + k_byte_offset;
+            const device ushort *packed16 = reinterpret_cast<const device ushort *>(weight_bytes + weight_base);
+            float quant0_acc = 0.0f;
+            float quant1_acc = 0.0f;
+            for (uint pack_index = 0; pack_index < 4; pack_index += 1) {
+                const ushort packed = packed16[pack_index];
+                const uint x_base = pack_index * 4;
+                quant0_acc += float(packed & 0x000f) * x0_thread[x_base + 0];
+                quant0_acc += float(packed & 0x00f0) * x0_thread[x_base + 1];
+                quant0_acc += float(packed & 0x0f00) * x0_thread[x_base + 2];
+                quant0_acc += float(packed & 0xf000) * x0_thread[x_base + 3];
+                quant1_acc += float(packed & 0x000f) * x1_thread[x_base + 0];
+                quant1_acc += float(packed & 0x00f0) * x1_thread[x_base + 1];
+                quant1_acc += float(packed & 0x0f00) * x1_thread[x_base + 2];
+                quant1_acc += float(packed & 0xf000) * x1_thread[x_base + 3];
+            }
+
+            const uint metadata_index = out_index * group_count + group_index;
+            const float scale = bf16_to_float(scales[metadata_index]);
+            const float bias = bf16_to_float(biases[metadata_index]);
+            result0[row] += scale * quant0_acc + bias * input0_sum;
+            result1[row] += scale * quant1_acc + bias * input1_sum;
+        }
+    }
+
+    for (uint row = 0; row < Q4_AFFINE_FAST_RESULTS_PER_SIMDGROUP; row += 1) {
+        result0[row] = simd_sum(result0[row]);
+        result1[row] = simd_sum(result1[row]);
+    }
+}
+
+kernel void linear_vec_q4_affine_group64_qmv_fast_argmax2_partial_bf16(
+    device const bfloat *input0 [[buffer(0)]],
+    device const bfloat *input1 [[buffer(1)]],
+    device const uint *weight [[buffer(2)]],
+    device const ushort *scales [[buffer(3)]],
+    device const ushort *biases [[buffer(4)]],
+    device float *partial_values0 [[buffer(5)]],
+    device uint *partial_indices0 [[buffer(6)]],
+    device float *partial_values1 [[buffer(7)]],
+    device uint *partial_indices1 [[buffer(8)]],
+    constant uint &out_dim [[buffer(9)]],
+    constant uint &in_dim [[buffer(10)]],
+    uint tid_in_threadgroup [[thread_index_in_threadgroup]],
+    ushort simd_lane_id [[thread_index_in_simdgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]],
+    uint threads_per_threadgroup [[threads_per_threadgroup]],
+    uint threadgroup_index [[threadgroup_position_in_grid]]
+) {
+    if (threads_per_threadgroup != Q4_AFFINE_FAST_THREADS_PER_THREADGROUP ||
+        in_dim % 512 != 0 ||
+        out_dim % Q4_AFFINE_FAST_RESULTS_PER_THREADGROUP != 0) return;
+
+    const uint out_base = threadgroup_index * Q4_AFFINE_FAST_RESULTS_PER_THREADGROUP +
+        uint(simdgroup_index) * Q4_AFFINE_FAST_RESULTS_PER_SIMDGROUP;
+    float result0[Q4_AFFINE_FAST_RESULTS_PER_SIMDGROUP];
+    float result1[Q4_AFFINE_FAST_RESULTS_PER_SIMDGROUP];
+    q4_affine_group64_qmv_fast_compute4x2_bf16(
+        input0,
+        input1,
+        weight,
+        scales,
+        biases,
+        out_base,
+        in_dim,
+        simd_lane_id,
+        result0,
+        result1
+    );
+
+    threadgroup float group_values0[Q4_AFFINE_FAST_RESULTS_PER_THREADGROUP];
+    threadgroup uint group_indices0[Q4_AFFINE_FAST_RESULTS_PER_THREADGROUP];
+    threadgroup float group_values1[Q4_AFFINE_FAST_RESULTS_PER_THREADGROUP];
+    threadgroup uint group_indices1[Q4_AFFINE_FAST_RESULTS_PER_THREADGROUP];
+    if (simd_lane_id == 0) {
+        const uint slot_base = uint(simdgroup_index) * Q4_AFFINE_FAST_RESULTS_PER_SIMDGROUP;
+        for (uint row = 0; row < Q4_AFFINE_FAST_RESULTS_PER_SIMDGROUP; row += 1) {
+            const uint slot = slot_base + row;
+            const uint out_index = out_base + row;
+            group_values0[slot] = float(bfloat(result0[row]));
+            group_indices0[slot] = out_index;
+            group_values1[slot] = float(bfloat(result1[row]));
+            group_indices1[slot] = out_index;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid_in_threadgroup == 0) {
+        float best_value0 = group_values0[0];
+        uint best_index0 = group_indices0[0];
+        float best_value1 = group_values1[0];
+        uint best_index1 = group_indices1[0];
+        for (uint slot = 1; slot < Q4_AFFINE_FAST_RESULTS_PER_THREADGROUP; slot += 1) {
+            const float value0 = group_values0[slot];
+            if (value0 > best_value0) {
+                best_value0 = value0;
+                best_index0 = group_indices0[slot];
+            }
+            const float value1 = group_values1[slot];
+            if (value1 > best_value1) {
+                best_value1 = value1;
+                best_index1 = group_indices1[slot];
+            }
+        }
+        partial_values0[threadgroup_index] = best_value0;
+        partial_indices0[threadgroup_index] = best_index0;
+        partial_values1[threadgroup_index] = best_value1;
+        partial_indices1[threadgroup_index] = best_index1;
+    }
+}
+
 kernel void q4_affine_group64_dequantize_bf16(
     device const uint *weight [[buffer(0)]],
     device const ushort *scales [[buffer(1)]],

@@ -117,6 +117,34 @@ pub const Q4Linear = struct {
         );
     }
 
+    pub fn encodeBf16ArgmaxPartial2(
+        self: *const Q4Linear,
+        ws: *metal.Workspace,
+        pipeline: metal.Pipeline,
+        input0_buf: metal.Buffer,
+        input1_buf: metal.Buffer,
+        partial_values0: metal.Buffer,
+        partial_indices0: metal.Buffer,
+        partial_values1: metal.Buffer,
+        partial_indices1: metal.Buffer,
+    ) !void {
+        if (self.in_dim % 512 != 0 or self.out_dim % QMV_FAST_RESULTS_PER_THREADGROUP != 0) return error.UnsupportedQuantization;
+        const input_bytes = std.math.mul(usize, @as(usize, self.in_dim), BF16_BYTES) catch return error.ContextSizeOverflow;
+        if (input0_buf.length < input_bytes or input1_buf.length < input_bytes) return error.InputBufferTooSmall;
+        const partial_count = self.out_dim / QMV_FAST_RESULTS_PER_THREADGROUP;
+        const partial_values_bytes = std.math.mul(usize, @as(usize, partial_count), @sizeOf(f32)) catch return error.ContextSizeOverflow;
+        if (partial_values0.length < partial_values_bytes or partial_values1.length < partial_values_bytes) return error.OutputBufferTooSmall;
+        const partial_indices_bytes = std.math.mul(usize, @as(usize, partial_count), @sizeOf(u32)) catch return error.ContextSizeOverflow;
+        if (partial_indices0.length < partial_indices_bytes or partial_indices1.length < partial_indices_bytes) return error.OutputBufferTooSmall;
+        const grid = std.math.mul(usize, @as(usize, partial_count), @as(usize, QMV_FAST_THREADS_PER_THREADGROUP)) catch return error.ContextSizeOverflow;
+        try ws.cmd.dispatch1DWithThreadgroup(
+            pipeline,
+            &.{ input0_buf, input1_buf, self.weight, self.scales, self.biases, partial_values0, partial_indices0, partial_values1, partial_indices1, self.out_dim_buf, self.in_dim_buf },
+            grid,
+            QMV_FAST_THREADS_PER_THREADGROUP,
+        );
+    }
+
     /// Encode bf16[token_count, in_dim] x q4[out_dim, in_dim] + residual -> bf16[token_count, out_dim].
     pub fn encodeBf16FastResidualAdd(
         self: *const Q4Linear,
@@ -134,6 +162,32 @@ pub const Q4Linear = struct {
         try ws.cmd.dispatch1DWithThreadgroup(
             pipeline,
             &.{ input_buf, self.weight, self.scales, self.biases, residual_buf, output_buf, token_count_buf, self.out_dim_buf, self.in_dim_buf },
+            grid,
+            QMV_FAST_THREADS_PER_THREADGROUP,
+        );
+    }
+
+    pub fn encodeBf16FastResidualAdd2(
+        self: *const Q4Linear,
+        ws: *metal.Workspace,
+        pipeline: metal.Pipeline,
+        input0_buf: metal.Buffer,
+        input1_buf: metal.Buffer,
+        residual0_buf: metal.Buffer,
+        residual1_buf: metal.Buffer,
+        output0_buf: metal.Buffer,
+        output1_buf: metal.Buffer,
+    ) !void {
+        if (self.in_dim % 512 != 0 or self.out_dim % QMV_FAST_RESULTS_PER_THREADGROUP != 0) return error.UnsupportedQuantization;
+        const input_bytes = std.math.mul(usize, @as(usize, self.in_dim), BF16_BYTES) catch return error.ContextSizeOverflow;
+        if (input0_buf.length < input_bytes or input1_buf.length < input_bytes) return error.InputBufferTooSmall;
+        const output_bytes = std.math.mul(usize, @as(usize, self.out_dim), BF16_BYTES) catch return error.ContextSizeOverflow;
+        if (residual0_buf.length < output_bytes or residual1_buf.length < output_bytes) return error.InputBufferTooSmall;
+        if (output0_buf.length < output_bytes or output1_buf.length < output_bytes) return error.OutputBufferTooSmall;
+        const grid = try qmvFastGrid(1, self.out_dim);
+        try ws.cmd.dispatch1DWithThreadgroup(
+            pipeline,
+            &.{ input0_buf, input1_buf, self.weight, self.scales, self.biases, residual0_buf, residual1_buf, output0_buf, output1_buf, self.out_dim_buf, self.in_dim_buf },
             grid,
             QMV_FAST_THREADS_PER_THREADGROUP,
         );

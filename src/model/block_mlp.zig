@@ -14,6 +14,7 @@ const Q4Linear = linear_q4.Q4Linear;
 const HIDDEN = dims.hidden;
 const INTERMEDIATE = 12288;
 pub const decode_mlp_gate_up_silu_bf16_kernel_name = "linear_vec_q4_affine_group64_multi2_silu_gate_bf16";
+pub const decode_mlp_gate_up_silu2_bf16_kernel_name = "linear_vec_q4_affine_group64_multi2_silu_gate2_bf16";
 const PREFILL_MLP_GATE_UP_CHUNK_ROWS: u32 = 8192;
 
 pub const PreparedMlpGateUpDenseRhs = struct {
@@ -275,6 +276,40 @@ pub const MlpBlock = struct {
         try self.down_proj.encodeBf16FastResidualAdd(ws, qmv_residual_add_bf16, gate, residual_bf16, out_bf16, 1);
     }
 
+    pub fn decodeResidual2Bf16(
+        self: *const MlpBlock,
+        ws: *metal.Workspace,
+        qmv_gate_up_silu2_bf16: metal.Pipeline,
+        qmv_residual_add2_bf16: metal.Pipeline,
+        x0_bf16: metal.Buffer,
+        x1_bf16: metal.Buffer,
+        residual0_bf16: metal.Buffer,
+        residual1_bf16: metal.Buffer,
+        out0_bf16: metal.Buffer,
+        out1_bf16: metal.Buffer,
+    ) !void {
+        const hidden_bytes = try hiddenBf16Bytes(1);
+        if (x0_bf16.length < hidden_bytes or x1_bf16.length < hidden_bytes) return error.InputBufferTooSmall;
+        if (residual0_bf16.length < hidden_bytes or residual1_bf16.length < hidden_bytes) return error.InputBufferTooSmall;
+        if (out0_bf16.length < hidden_bytes or out1_bf16.length < hidden_bytes) return error.OutputBufferTooSmall;
+
+        const intermediate_bytes = try intermediateBf16Bytes(1);
+        const gate0 = try ws.scratch(intermediate_bytes);
+        const gate1 = try ws.scratch(intermediate_bytes);
+        try self.encodeGateUpSilu2Bf16(ws, qmv_gate_up_silu2_bf16, x0_bf16, x1_bf16, gate0, gate1);
+        ws.barrier();
+        try self.down_proj.encodeBf16FastResidualAdd2(
+            ws,
+            qmv_residual_add2_bf16,
+            gate0,
+            gate1,
+            residual0_bf16,
+            residual1_bf16,
+            out0_bf16,
+            out1_bf16,
+        );
+    }
+
     fn encodeGateUpSiluBf16(
         self: *const MlpBlock,
         ws: *metal.Workspace,
@@ -301,6 +336,44 @@ pub const MlpBlock = struct {
                 self.up_proj.scales,
                 self.up_proj.biases,
                 out_bf16,
+                self.gate_proj.out_dim_buf,
+                self.gate_proj.in_dim_buf,
+            },
+            grid,
+            linear_q4.QMV_FAST_THREADS_PER_THREADGROUP,
+        );
+    }
+
+    fn encodeGateUpSilu2Bf16(
+        self: *const MlpBlock,
+        ws: *metal.Workspace,
+        pipeline: metal.Pipeline,
+        x0_bf16: metal.Buffer,
+        x1_bf16: metal.Buffer,
+        out0_bf16: metal.Buffer,
+        out1_bf16: metal.Buffer,
+    ) !void {
+        if (self.gate_proj.in_dim != HIDDEN or self.up_proj.in_dim != HIDDEN) return error.UnsupportedQuantization;
+        if (self.gate_proj.out_dim != INTERMEDIATE or self.up_proj.out_dim != INTERMEDIATE) return error.UnsupportedQuantization;
+        const hidden_bytes = try hiddenBf16Bytes(1);
+        const intermediate_bytes = try intermediateBf16Bytes(1);
+        if (x0_bf16.length < hidden_bytes or x1_bf16.length < hidden_bytes) return error.InputBufferTooSmall;
+        if (out0_bf16.length < intermediate_bytes or out1_bf16.length < intermediate_bytes) return error.OutputBufferTooSmall;
+
+        const grid = try linear_q4.qmvFastGrid(1, INTERMEDIATE);
+        try ws.cmd.dispatch1DWithThreadgroup(
+            pipeline,
+            &.{
+                x0_bf16,
+                x1_bf16,
+                self.gate_proj.weight,
+                self.gate_proj.scales,
+                self.gate_proj.biases,
+                self.up_proj.weight,
+                self.up_proj.scales,
+                self.up_proj.biases,
+                out0_bf16,
+                out1_bf16,
                 self.gate_proj.out_dim_buf,
                 self.gate_proj.in_dim_buf,
             },

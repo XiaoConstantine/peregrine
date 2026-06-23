@@ -22,14 +22,16 @@ const decoder_layer = @import("../model/decoder_layer.zig");
 const block_attn = @import("../model/block_attn.zig");
 const block_linear = @import("../model/block_linear.zig");
 const prefix_state_cache = @import("prefix_state_cache.zig");
+const dims = @import("../model/dims.zig");
 
 const Cache = prefix_state_cache.Cache;
 const monotonicNowNs = runtime_time.monotonicNowNs;
 const log = std.log.scoped(.peregrine_serve);
 
 const MAGIC: u64 = 0x3153_5846_5047_5250; // "PRGPFXS1" little-endian
-const VERSION: u32 = 1;
+const VERSION: u32 = 3;
 const DTYPE_BF16: u32 = 0;
+const hiddenRowsBytes = dims.hiddenRowsBytes;
 
 pub const default_file_name = "qwen35-9b-q4-prefix-state.bin";
 
@@ -49,6 +51,9 @@ const Header = extern struct {
     token_count: u64,
     next_token: u32,
     next_token_valid: u32,
+    /// 1 when the hidden section holds real captured normalized hiddens, 0 when
+    /// the section is present but zero-filled (written by a non-MTP run).
+    hidden_valid: u32,
 };
 
 const LINEAR_CONV_BYTES: usize = (block_linear.CONV_K - 1) * block_linear.CONV_DIM * @sizeOf(f32);
@@ -71,7 +76,8 @@ fn expectedFileBytes(token_count: usize) !usize {
     const value_bytes = key_bytes;
     const full_bytes = try checked_math.product(.{ counts.full, key_bytes + value_bytes });
     const linear_bytes = counts.linear * (LINEAR_CONV_BYTES + LINEAR_RECUR_BYTES);
-    return @sizeOf(Header) + tokens_bytes + linear_bytes + full_bytes;
+    const hidden_bytes = try hiddenRowsBytes(token_count);
+    return @sizeOf(Header) + tokens_bytes + linear_bytes + full_bytes + hidden_bytes;
 }
 
 fn keyRunStart(head: usize, stride: usize) usize {
@@ -267,6 +273,7 @@ fn save(io: std.Io, path: []const u8, cache: *const Cache, model_fingerprint: u6
         .token_count = token_count,
         .next_token = entry.cached_next_token,
         .next_token_valid = @intFromBool(entry.cached_next_token_valid),
+        .hidden_valid = @intFromBool(entry.hidden_valid),
     };
     try w.writeAll(std.mem.asBytes(&header));
     try w.writeAll(std.mem.sliceAsBytes(entry.tokens.items));
@@ -291,6 +298,26 @@ fn save(io: std.Io, path: []const u8, cache: *const Cache, model_fingerprint: u6
             }
         },
     };
+    // Hidden section: normalized target hidden rows for the cached prefix.
+    // Always `hiddenRowsBytes(token_count)` bytes so the file size is
+    // deterministic. Real rows when `entry.hidden_valid`; zero-fill
+    // otherwise (non-MTP run, or MTP run that hasn't captured hiddens yet).
+    // The header's `hidden_valid` flag tells the loader which is which.
+    const hidden_bytes = try hiddenRowsBytes(token_count);
+    if (entry.hidden) |hidden| {
+        if (hidden.length < hidden_bytes) return error.SequenceTooLong;
+        try w.writeAll(hidden.slice(u8)[0..hidden_bytes]);
+    } else {
+        const zero = try std.heap.page_allocator.alloc(u8, @min(hidden_bytes, 1 << 20));
+        defer std.heap.page_allocator.free(zero);
+        @memset(zero, 0);
+        var remaining = hidden_bytes;
+        while (remaining > 0) {
+            const n = @min(remaining, zero.len);
+            try w.writeAll(zero[0..n]);
+            remaining -= n;
+        }
+    }
     try w.flush();
     try atomic.replace(io);
 }
@@ -324,6 +351,7 @@ fn load(
     if (header.model_fingerprint != model_fingerprint) return null;
     if (header.next_token_valid > 1) return null;
     if (header.next_token_valid == 1 and header.next_token >= vocab) return null;
+    if (header.hidden_valid > 1) return null;
     const token_count = std.math.cast(usize, header.token_count) orelse return null;
     if (token_count == 0 or token_count > cache.max_tokens) return null;
     const expected_bytes = expectedFileBytes(token_count) catch return null;
@@ -360,6 +388,27 @@ fn load(
 
     entry.cached_next_token = header.next_token;
     entry.cached_next_token_valid = header.next_token_valid == 1;
+
+    // Hidden section: read into the entry's hidden buffer when present (MTP
+    // enabled); otherwise discard the bytes so the stream stays in sync.
+    // `hidden_valid` follows the header flag: a v3 file written by a non-MTP
+    // run has the section zero-filled and the flag clear, so MTP drafter
+    // seeding falls back instead of consuming all-zero hiddens.
+    const hidden_bytes = try hiddenRowsBytes(token_count);
+    if (entry.hidden) |hidden| {
+        if (hidden.length < hidden_bytes) return error.SequenceTooLong;
+        try r.readSliceAll(hidden.slice(u8)[0..hidden_bytes]);
+        entry.hidden_valid = header.hidden_valid == 1;
+    } else {
+        const scratch = try std.heap.page_allocator.alloc(u8, @min(hidden_bytes, 1 << 20));
+        defer std.heap.page_allocator.free(scratch);
+        var remaining = hidden_bytes;
+        while (remaining > 0) {
+            const n = @min(remaining, scratch.len);
+            try r.readSliceAll(scratch[0..n]);
+            remaining -= n;
+        }
+    }
     return token_count;
 }
 
@@ -400,7 +449,8 @@ test "expected file bytes follow the one-model layer topology" {
     const expected = @sizeOf(Header) +
         token_count * @sizeOf(u32) +
         24 * (LINEAR_CONV_BYTES + LINEAR_RECUR_BYTES) +
-        8 * 2 * (block_attn.NUM_KV * token_count * block_attn.HEAD_DIM * FULL_VALUE_BYTES);
+        8 * 2 * (block_attn.NUM_KV * token_count * block_attn.HEAD_DIM * FULL_VALUE_BYTES) +
+        try hiddenRowsBytes(token_count);
     try std.testing.expectEqual(expected, try expectedFileBytes(token_count));
 }
 
@@ -488,4 +538,102 @@ test "save and load round-trip the cached prefix" {
     const small_vocab = try load(std.testing.io, std.testing.allocator, &device, &dst, path, fingerprint, 100);
     try std.testing.expectEqual(@as(?usize, null), small_vocab);
     try std.testing.expectEqual(token_count, dst.activeTokenCount());
+}
+
+test "save and load round-trip the normalized hidden states" {
+    var device = metal.Device.create() catch |err| switch (err) {
+        error.DeviceUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer device.destroy();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const dir_path = path_buf[0..dir_len];
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/prefix-state.bin", .{dir_path});
+    defer std.testing.allocator.free(path);
+
+    const token_count: usize = 5;
+    var src = try Cache.init(64, 16);
+    defer src.deinit(std.testing.allocator);
+    src.enableHiddenTracking();
+    _ = try src.loadEntrySlot(std.testing.allocator, &device, token_count);
+    const src_entry = src.activeEntry().?;
+    for (0..token_count) |i| src_entry.tokens.items[i] = @intCast(i + 10);
+    src_entry.cached_next_token = 777;
+    src_entry.cached_next_token_valid = true;
+    // Fill the hidden buffer with a recognizable pattern across the valid rows.
+    const hidden_bytes = try hiddenRowsBytes(token_count);
+    const src_hidden = src_entry.hidden.?;
+    try std.testing.expect(hidden_bytes <= src_hidden.length);
+    for (src_hidden.slice(u8)[0..hidden_bytes]) |*b| b.* = 0xAB;
+    src_entry.hidden_valid = true;
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"a\":1}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model-00001.safetensors", .data = "weights" });
+    const fingerprint = try modelFingerprint(std.testing.allocator, std.testing.io, dir_path);
+    try save(std.testing.io, path, &src, fingerprint);
+
+    var dst = try Cache.init(64, 16);
+    defer dst.deinit(std.testing.allocator);
+    dst.enableHiddenTracking();
+    const loaded = try load(std.testing.io, std.testing.allocator, &device, &dst, path, fingerprint, 8192);
+    try std.testing.expectEqual(@as(?usize, token_count), loaded);
+    const dst_entry = dst.activeEntryConst().?;
+    try std.testing.expectEqualSlices(u32, src_entry.tokens.items, dst_entry.tokens.items);
+    // Hidden rows survive the round-trip.
+    const dst_hidden = dst_entry.hidden.?;
+    try std.testing.expectEqualSlices(u8, src_hidden.slice(u8)[0..hidden_bytes], dst_hidden.slice(u8)[0..hidden_bytes]);
+    try std.testing.expect(dst_entry.hidden_valid);
+}
+
+test "non-MTP v3 file loads with hidden_valid clear under MTP" {
+    // A file written by a non-MTP run stores zero hiddens and clears
+    // `hidden_valid`. Loading it into an MTP-enabled cache must allocate the
+    // hidden buffer (so capacity is ready) but keep `hidden_valid` false, so
+    // `seedMtpDrafter` falls back to greedy decode instead of consuming
+    // all-zero hiddens.
+    var device = metal.Device.create() catch |err| switch (err) {
+        error.DeviceUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer device.destroy();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const dir_path = path_buf[0..dir_len];
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/prefix-state.bin", .{dir_path});
+    defer std.testing.allocator.free(path);
+
+    const token_count: usize = 4;
+    // Source cache has no hidden tracking (non-MTP run).
+    var src = try Cache.init(64, 16);
+    defer src.deinit(std.testing.allocator);
+    _ = try src.loadEntrySlot(std.testing.allocator, &device, token_count);
+    const src_entry = src.activeEntry().?;
+    for (0..token_count) |i| src_entry.tokens.items[i] = @intCast(i + 1);
+    src_entry.cached_next_token = 99;
+    src_entry.cached_next_token_valid = true;
+    try std.testing.expect(src_entry.hidden == null);
+    try std.testing.expect(!src_entry.hidden_valid);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"a\":1}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model-00001.safetensors", .data = "weights" });
+    const fingerprint = try modelFingerprint(std.testing.allocator, std.testing.io, dir_path);
+    try save(std.testing.io, path, &src, fingerprint);
+
+    // Destination cache enables hidden tracking (MTP run).
+    var dst = try Cache.init(64, 16);
+    defer dst.deinit(std.testing.allocator);
+    dst.enableHiddenTracking();
+    const loaded = try load(std.testing.io, std.testing.allocator, &device, &dst, path, fingerprint, 8192);
+    try std.testing.expectEqual(@as(?usize, token_count), loaded);
+    const dst_entry = dst.activeEntryConst().?;
+    // Buffer allocated (capacity ready) but not valid.
+    try std.testing.expect(dst_entry.hidden != null);
+    try std.testing.expect(!dst_entry.hidden_valid);
 }
