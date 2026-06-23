@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 usage:
-  scripts/run-qwen35 [serve] [--host HOST] [--port PORT] [--repo DIR] [--agent-optimized|--no-agent-optimized] [--max-total-tokens N] [--default-new-tokens N] [--max-new-tokens N] [--prefix-cache-tokens N] [--prefill-chunk-tokens N] [--prefill-chunk-group N] [--max-active-connections N] [--socket-timeout-s N] [--prewarm-prompt-file FILE] [--prewarm-request-file FILE] [--no-auto-prewarm] [--prefix-state-file FILE] [--no-prefix-state] [--mtp|--mtp-dir DIR] [--dry-run]
+  scripts/run-qwen35 [serve] [--host HOST] [--port PORT] [--repo DIR] [--agent-optimized|--no-agent-optimized] [--max-total-tokens N] [--default-new-tokens N] [--max-new-tokens N] [--prefix-cache-tokens N] [--prefill-chunk-tokens N] [--prefill-chunk-group N] [--max-active-connections N] [--socket-timeout-s N] [--prewarm-prompt-file FILE] [--prewarm-request-file FILE] [--no-auto-prewarm] [--prefix-state-file FILE] [--no-prefix-state] [--mtp|--no-mtp|--mtp-dir DIR] [--dry-run]
 
 Defaults:
   mode:              serve
@@ -19,7 +19,10 @@ Defaults:
   prewarm:           auto from $PEREGRINE_PI_PREWARM_REQUEST or /tmp/pi-peregrine-request.json
   prefix state:      persisted to ~/.cache/peregrine/ after startup prewarm and
                      reloaded on the next start (disable with --no-prefix-state)
-  mtp:               disabled unless --mtp is set or --mtp-dir points at a compatible sidecar
+  mtp:               auto-enabled when the Qwen3.5-9B-MTP-4bit sidecar is found
+                     (up to 2 tokens/verifier pass: 1 drafted + 1 bonus); disable
+                     with --no-mtp. Adds ~192 MiB prefix-cache hidden buffer
+                     (prefix-cache-tokens * 4096 * 2 bytes, bounded).
   repo:              $PEREGRINE_QWEN35_REPO, newest HF cache snapshot, or /tmp/qwen3.5-9b-q4
   mtp repo:          $PEREGRINE_QWEN35_MTP_REPO, newest HF cache snapshot, or /tmp/qwen3.5-9b-mtp-q4
   build:             zig build -Doptimize=ReleaseFast
@@ -108,7 +111,10 @@ find_mtp_repo() {
     return
   fi
 
-  die "could not find mlx-community/Qwen3.5-9B-MTP-4bit; run 'hf download mlx-community/Qwen3.5-9B-MTP-4bit', set PEREGRINE_QWEN35_MTP_REPO, or pass --mtp-dir"
+  # Not found via auto-discovery. Return non-zero so callers can fall back to
+  # no-MTP; die only when the user explicitly pointed us somewhere missing.
+  printf "peregrine: could not find mlx-community/Qwen3.5-9B-MTP-4bit; run 'hf download mlx-community/Qwen3.5-9B-MTP-4bit', set PEREGRINE_QWEN35_MTP_REPO, or pass --mtp-dir\n" >&2
+  return 1
 }
 
 build_release() {
@@ -148,7 +154,7 @@ main() {
   local auto_prewarm="1"
   local prefix_state_file=""
   local prefix_state="1"
-  local mtp_enabled="0"
+  local mtp_enabled=""
   local mtp_dir=""
   local dry_run="0"
 
@@ -244,6 +250,10 @@ main() {
         mtp_enabled="1"
         shift
         ;;
+      --no-mtp)
+        mtp_enabled="0"
+        shift
+        ;;
       --mtp-dir)
         [[ $# -ge 2 ]] || die "--mtp-dir requires a value"
         mtp_enabled="1"
@@ -269,11 +279,25 @@ main() {
     repo="$(find_repo)"
   fi
   [[ -d "$repo" ]] || die "checkpoint directory does not exist: $repo"
-  if [[ "$mtp_enabled" == "1" && -z "$mtp_dir" ]]; then
-    mtp_dir="$(find_mtp_repo)"
+  # MTP auto-enable: when neither --mtp nor --no-mtp was passed, enable MTP
+  # if the sidecar is discoverable. --mtp-dir forces it on with an explicit
+  # path; --no-mtp forces it off even if the sidecar is present.
+  if [[ -z "$mtp_enabled" ]]; then
+    if mtp_dir="$(find_mtp_repo 2>/dev/null)"; then
+      mtp_enabled="1"
+    else
+      mtp_enabled="0"
+    fi
+  elif [[ "$mtp_enabled" == "1" && -z "$mtp_dir" ]]; then
+    # --mtp was passed explicitly: a missing sidecar is a user error, not a
+    # silent fallback to greedy.
+    mtp_dir="$(find_mtp_repo)" || die "--mtp requested but no MTP sidecar found; run 'hf download mlx-community/Qwen3.5-9B-MTP-4bit' or pass --mtp-dir"
   fi
   if [[ -n "$mtp_dir" ]]; then
     [[ -d "$mtp_dir" ]] || die "MTP directory does not exist: $mtp_dir"
+    printf 'peregrine: MTP speculative decode enabled (sidecar: %s)\n' "$mtp_dir" >&2
+  else
+    printf 'peregrine: MTP speculative decode disabled (greedy decode)\n' >&2
   fi
 
   if [[ "$auto_prewarm" == "1" && -z "$prewarm_prompt_file" && -z "$prewarm_request_file" ]]; then
