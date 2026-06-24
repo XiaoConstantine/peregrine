@@ -24,6 +24,7 @@ const decode_loop = @import("server/decode_loop.zig");
 const errors = @import("server/errors.zig");
 const prefix_state_cache = @import("server/prefix_state_cache.zig");
 const prefix_persist = @import("server/prefix_persist.zig");
+const metrics_mod = @import("server/metrics.zig");
 const stop_sequences = @import("stop_sequences.zig");
 const DeviceModel = model_mod.DeviceModel;
 const ModelState = model_mod.ModelState;
@@ -77,7 +78,7 @@ const MAX_BODY = 1 << 20; // 1 MiB request-body ceiling
 const MAX_PREWARM_PROMPT_BYTES = 1 << 20;
 pub const MAX_SOCKET_TIMEOUT_SECONDS: u32 = 3600;
 const health_body =
-    "peregrine ok - GET /health, /v1/me, /v1/models, /v1/models/{id}, /v1/prefix/status; " ++
+    "peregrine ok - GET /health, /v1/me, /v1/models, /v1/models/{id}, /v1/prefix/status, /v1/metrics, /v1/metrics/history, /dashboard; " ++
     "POST /v1/chat/completions, /v1/prefix/warmup\n";
 const health_headers = api_error.cors_headers ++ [_]http.Header{
     .{ .name = "content-type", .value = "text/plain; charset=utf-8" },
@@ -117,6 +118,7 @@ const Context = struct {
     connection_slots: Io.Semaphore,
     socket_timeout_seconds: u32,
     decode_lock: Io.Mutex = .init,
+    metrics: metrics_mod.MetricsState,
     trace_prefill: bool,
 };
 
@@ -171,6 +173,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, model_dir: []const u8, host: []const 
         .prefix_cache = try prefix_state_cache.Cache.init(@min(options.prefix_cache_tokens, options.max_total_tokens), options.prefill_chunk_tokens),
         .connection_slots = .{ .permits = options.max_active_connections },
         .socket_timeout_seconds = options.socket_timeout_seconds,
+        .metrics = metrics_mod.MetricsState.init(io),
         .trace_prefill = std.c.getenv("PEREGRINE_TRACE_PREFILL") != null,
     };
     defer ctx.prefix_cache.deinit(ctx.request_gpa);
@@ -330,6 +333,12 @@ fn serveGet(req: *http.Server.Request, ctx: *Context, path: []const u8) !void {
         try req.respond(body, .{ .keep_alive = true, .extra_headers = &api_response.json_ct });
     } else if (std.mem.eql(u8, path, "/v1/prefix/status")) {
         try respondPrefixStatus(req, ctx);
+    } else if (std.mem.eql(u8, path, "/v1/metrics")) {
+        try respondMetrics(req, ctx);
+    } else if (std.mem.eql(u8, path, "/v1/metrics/history")) {
+        try respondMetricsHistory(req, ctx);
+    } else if (std.mem.eql(u8, path, "/dashboard")) {
+        try respondDashboard(req, ctx);
     } else if (std.mem.eql(u8, path, "/v1/chat/completions")) {
         try errors.respondUnsupportedOpenAIEndpoint(ctx.request_gpa, req);
     } else if (postRouteForPath(path) != null) {
@@ -500,6 +509,117 @@ fn respondPrefixStatusJson(req: *http.Server.Request, ctx: *Context, status: Pre
     }
     try req.respond(out.items, .{ .keep_alive = true, .extra_headers = &api_response.json_ct });
 }
+
+fn respondMetrics(req: *http.Server.Request, ctx: *Context) !void {
+    // Cumulative counters and recent aggregates never need the decode lock.
+    const t = ctx.metrics.totals();
+    const r = ctx.metrics.recent();
+
+    // Try to acquire the decode lock for a live prefix-cache snapshot. If
+    // busy, return busy=true with null for unsafe live fields (mirrors the
+    // /v1/prefix/status pattern). Do NOT hold the history mutex while
+    // trying the decode lock — that would deadlock with the write path.
+    var cache_snap: ?metrics_mod.CacheSnapshot = null;
+    var cache_stats: ?metrics_mod.CumulativeCacheStats = null;
+    var busy = false;
+    if (ctx.decode_lock.tryLock()) {
+        cache_snap = prefixCacheSnapshot(ctx);
+        cache_stats = prefixCacheCumulativeStats(ctx);
+        ctx.decode_lock.unlock(ctx.io);
+    } else {
+        busy = true;
+    }
+
+    // History metadata (count + oldest/newest id) under the history lock.
+    var history_count: usize = 0;
+    var oldest_id: ?u64 = null;
+    var newest_id: ?u64 = null;
+    {
+        var buf: [metrics_mod.HISTORY_CAPACITY]metrics_mod.RequestMetricsRecord = undefined;
+        const n = ctx.metrics.snapshotHistory(&buf);
+        history_count = n;
+        if (n > 0) {
+            oldest_id = buf[0].request_id;
+            newest_id = buf[n - 1].request_id;
+        }
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(ctx.request_gpa);
+    try metrics_mod.renderMetricsSnapshot(
+        &out,
+        ctx.request_gpa,
+        t,
+        r,
+        cache_snap,
+        cache_stats,
+        busy,
+        .{
+            .max_cache_tokens = @intCast(ctx.prefix_cache.max_tokens),
+            .prefill_chunk_tokens = @intCast(ctx.prefill_chunk_tokens),
+            .prefill_chunk_group_size = @intCast(ctx.prefill_chunk_group_size),
+        },
+        history_count,
+        oldest_id,
+        newest_id,
+    );
+    try req.respond(out.items, .{ .keep_alive = true, .extra_headers = &api_response.json_ct });
+}
+
+fn respondMetricsHistory(req: *http.Server.Request, ctx: *Context) !void {
+    // Snapshot the ring under the history lock, then render after release.
+    var buf: [metrics_mod.HISTORY_CAPACITY]metrics_mod.RequestMetricsRecord = undefined;
+    const n = ctx.metrics.snapshotHistory(&buf);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(ctx.request_gpa);
+    try metrics_mod.renderMetricsHistory(&out, ctx.request_gpa, buf[0..n]);
+    try req.respond(out.items, .{ .keep_alive = true, .extra_headers = &api_response.json_ct });
+}
+
+fn respondDashboard(req: *http.Server.Request, ctx: *Context) !void {
+    _ = ctx;
+    try req.respond(dashboard_html, .{
+        .keep_alive = true,
+        .extra_headers = &dashboard_headers,
+    });
+}
+
+/// Snapshot of live prefix-cache occupancy. Caller must hold the decode lock.
+fn prefixCacheSnapshot(ctx: *const Context) metrics_mod.CacheSnapshot {
+    const cs = ctx.prefix_cache.stats();
+    return .{
+        .cached_tokens = @intCast(ctx.prefix_cache.activeTokenCount()),
+        .max_cache_tokens = @intCast(cs.max_tokens),
+        .resident_entries = @intCast(cs.entry_count),
+        .reserved_tokens = @intCast(cs.reserved_tokens),
+        .resident_tokens = @intCast(ctx.prefix_cache.resident_tokens),
+        .pinned_entries = @intCast(ctx.prefix_cache.pinnedEntryCount()),
+        .cached_logits = ctx.prefix_cache.activeCachedNextTokenValid(),
+        .evictions_total = cs.evictions,
+    };
+}
+
+/// Cumulative cache counters for the metrics snapshot. Caller must hold the
+/// decode lock (the underlying counters are read safely under it).
+fn prefixCacheCumulativeStats(ctx: *const Context) metrics_mod.CumulativeCacheStats {
+    const cs = ctx.prefix_cache.stats();
+    return .{
+        .hits = @intCast(cs.hits),
+        .misses = @intCast(cs.misses),
+        .hit_tokens = @intCast(cs.hit_tokens),
+        .computed_tokens = @intCast(cs.computed_tokens),
+        .evictions = @intCast(cs.evictions),
+        .prefill_chunk_tokens = @intCast(ctx.prefill_chunk_tokens),
+        .prefill_chunk_group_size = @intCast(ctx.prefill_chunk_group_size),
+    };
+}
+
+const dashboard_headers = api_error.cors_headers ++ [_]http.Header{
+    .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+};
+
+const dashboard_html = @embedFile("server/dashboard.html");
 
 const StartupPrewarmProgress = struct {
     label: []const u8,
@@ -709,9 +829,15 @@ fn generateWithStaticPrefixCache(
     ctx.decode_lock.lockUncancelable(ctx.io);
     defer ctx.decode_lock.unlock(ctx.io);
 
-    const request_start_ns = if (ctx.trace_prefill) monotonicNowNs() else 0;
-    const cache_store_limit = try prewarmStaticPromptTokenPrefixLocked(ctx, prompt_ids, static_prefix_prompt, callback);
-    return generateWithPrefixCacheLocked(ctx, prompt_ids, out, callback, cache_store_limit, stop_token_sequences, request_start_ns);
+    // Structured metrics are always collected (independent of trace_prefill)
+    // so the dashboard has data even when the env var is not set.
+    var mreq = ctx.metrics.beginRequest(@intCast(out.len));
+    const request_start_ns = monotonicNowNs();
+    const cache_store_limit = prewarmStaticPromptTokenPrefixLocked(ctx, prompt_ids, static_prefix_prompt, callback) catch |e| {
+        mreq.finishError(metricsErrorKind(e));
+        return e;
+    };
+    return generateWithPrefixCacheLocked(ctx, prompt_ids, out, callback, cache_store_limit, stop_token_sequences, request_start_ns, &mreq);
 }
 
 const PrefixReuse = struct {
@@ -733,20 +859,58 @@ fn generateWithPrefixCacheLocked(
     cache_store_limit: ?usize,
     stop_token_sequences: []const []const u32,
     request_start_ns: u64,
+    mreq: *metrics_mod.Request,
 ) !usize {
-    if (prompt_ids.len == 0 or out.len == 0) return error.EmptyInput;
-    _ = try generation_limits.effectiveMaxNewTokens(prompt_ids.len, @intCast(out.len), ctx.max_total);
-    const requested = std.math.add(usize, prompt_ids.len, out.len) catch return error.SequenceTooLong;
-    const trace_start_ns = if (ctx.trace_prefill and request_start_ns != 0) request_start_ns else if (ctx.trace_prefill) monotonicNowNs() else 0;
-    var decode_metrics = decode_loop.Metrics{ .request_start_ns = trace_start_ns };
-    const metrics_ptr: ?*decode_loop.Metrics = if (ctx.trace_prefill) &decode_metrics else null;
+    if (prompt_ids.len == 0 or out.len == 0) {
+        mreq.finishError(.validation);
+        return error.EmptyInput;
+    }
+    _ = generation_limits.effectiveMaxNewTokens(prompt_ids.len, @intCast(out.len), ctx.max_total) catch |e| {
+        mreq.finishError(.validation);
+        return e;
+    };
+    const requested = std.math.add(usize, prompt_ids.len, out.len) catch {
+        mreq.finishError(.validation);
+        return error.SequenceTooLong;
+    };
+    // decode_metrics is always populated so structured metrics can capture
+    // first-emit/decode-step/acceptance data independent of trace_prefill.
+    var decode_metrics = decode_loop.Metrics{ .request_start_ns = request_start_ns, .time_emits = ctx.trace_prefill };
+    const metrics_ptr: ?*decode_loop.Metrics = &decode_metrics;
 
-    const prefix_reuse = try resolveReusablePrefix(ctx, prompt_ids, callback, cache_store_limit);
+    const prefix_reuse = resolveReusablePrefix(ctx, prompt_ids, callback, cache_store_limit) catch |e| {
+        mreq.finishError(metricsErrorKind(e));
+        return e;
+    };
     const local_capacity = requested - prefix_reuse.reuse_len;
+    // Track computed tokens (prompt minus reused prefix) for cumulative
+    // cache-efficiency stats. A direct-fill computes the whole prompt into
+    // the empty cache, so count it as fully computed even though reuse_len
+    // == prompt_ids.len (the store records it as a future hit).
+    const computed_tokens = if (prefix_reuse.direct_fill_empty_cache)
+        prompt_ids.len
+    else
+        prompt_ids.len - prefix_reuse.reuse_len;
+    ctx.prefix_cache.recordComputedTokens(computed_tokens);
+    mreq.setPromptStats(
+        @intCast(prompt_ids.len),
+        @intCast(out.len),
+        @intCast(prefix_reuse.reuse_len),
+        @intCast(computed_tokens),
+    );
+    // On any error return after this point, record the request as failed.
+    // Success paths call mreq.finish() explicitly before returning and set
+    // `mreq_finished` to suppress this errdefer.
+    var mreq_finished = false;
+    errdefer if (!mreq_finished) mreq.finishError(.generation);
     if (ctx.trace_prefill) {
+        const hit_ratio = if (prompt_ids.len > 0)
+            @as(f64, @floatFromInt(prefix_reuse.reuse_len)) / @as(f64, @floatFromInt(prompt_ids.len))
+        else
+            0;
         log.info(
-            "trace: generate prompt_tokens={d} out_tokens={d} reuse_tokens={d} local_capacity={d} direct_fill_empty_cache={}",
-            .{ prompt_ids.len, out.len, prefix_reuse.reuse_len, local_capacity, prefix_reuse.direct_fill_empty_cache },
+            "trace: generate prompt_tokens={d} out_tokens={d} reuse_tokens={d} computed_tokens={d} prefix_hit_ratio={d:.3} local_capacity={d} direct_fill_empty_cache={}",
+            .{ prompt_ids.len, out.len, prefix_reuse.reuse_len, computed_tokens, hit_ratio, local_capacity, prefix_reuse.direct_fill_empty_cache },
         );
     }
 
@@ -787,8 +951,12 @@ fn generateWithPrefixCacheLocked(
         false,
         mtp_prompt_hidden,
     );
-    const prefill_done_ns = if (ctx.trace_prefill) monotonicNowNs() else 0;
+    const prefill_done_ns = monotonicNowNs();
     const decode_prefix = ctx.prefix_cache.prefixState(initial_next_token.prefix_match);
+    // Carry the drafter-seed measurement to the greedy fallback path so MTP
+    // fallback records still report the drafter-prefill cost that contributed
+    // to setup latency.
+    var fallback_drafter_seed_ms: ?f64 = null;
     if (ctx.mtp) |drafter| mtp_decode: {
         var mtp_state = try mtp_mod.State.initBf16(ctx.device, requested);
         defer mtp_state.deinit();
@@ -797,6 +965,7 @@ fn generateWithPrefixCacheLocked(
         // skipped because the full prompt was already cached with a valid next
         // token, copy the cached hidden rows into the prompt-hidden buffer
         // first; otherwise prefill already populated it.
+        const drafter_seed_start_ns = monotonicNowNs();
         const mtp_ready = try seedMtpDrafter(
             ctx,
             drafter,
@@ -806,6 +975,11 @@ fn generateWithPrefixCacheLocked(
             initial_next_token.prefix_match,
             prefix_reuse.reuse_len,
         );
+        const drafter_seed_ms: ?f64 = elapsedMs(drafter_seed_start_ns, monotonicNowNs());
+        fallback_drafter_seed_ms = drafter_seed_ms;
+        if (ctx.trace_prefill) {
+            log.info("trace: mtp drafter seed ms={d:.3}", .{drafter_seed_ms.?});
+        }
         if (!mtp_ready) break :mtp_decode;
 
         var verifier_state = try ModelState.initBf16FullCaches(ctx.device, local_capacity);
@@ -854,7 +1028,8 @@ fn generateWithPrefixCacheLocked(
             .trace = ctx.trace_prefill,
             .metrics = metrics_ptr,
         });
-        if (ctx.trace_prefill) logDecodeMetrics("mtp", &decode_metrics, prompt_ids.len, out.len, generated, prefill_done_ns);
+        if (ctx.trace_prefill) logDecodeMetrics("mtp", &decode_metrics, prompt_ids.len, out.len, generated, prefill_done_ns, ctx.prefix_cache.stats());
+        finishMetricsRequest(ctx, mreq, .mtp, &decode_metrics, prefill_done_ns, generated, drafter_seed_ms, &mreq_finished);
         return generated;
     }
     if (metrics_ptr) |metrics| metrics.decode_start_ns = monotonicNowNs();
@@ -875,8 +1050,107 @@ fn generateWithPrefixCacheLocked(
         .trace = ctx.trace_prefill,
         .metrics = metrics_ptr,
     });
-    if (ctx.trace_prefill) logDecodeMetrics("greedy", &decode_metrics, prompt_ids.len, out.len, generated, prefill_done_ns);
+    if (ctx.trace_prefill) logDecodeMetrics("greedy", &decode_metrics, prompt_ids.len, out.len, generated, prefill_done_ns, ctx.prefix_cache.stats());
+    finishMetricsRequest(ctx, mreq, .greedy, &decode_metrics, prefill_done_ns, generated, fallback_drafter_seed_ms, &mreq_finished);
     return generated;
+}
+
+/// Decode metric values computed from `decode_loop.Metrics`. Shared between
+/// trace logging and structured metrics recording so both paths use the same
+/// formulas.
+const DecodeMetricValues = struct {
+    prefill_ms: f64,
+    setup_ms: f64,
+    ttft_ms: f64,
+    decode_ms: f64,
+    tok_s: f64,
+    itl_ms: f64,
+    emit_tok_s: f64,
+    decode_steps: u32,
+    tokens_per_step: f64,
+    accepted: u32,
+    attempted: u32,
+    acceptance: f64,
+};
+
+fn computeDecodeMetricValues(
+    metrics: *const decode_loop.Metrics,
+    generated_tokens: usize,
+    prefill_done_ns: u64,
+) DecodeMetricValues {
+    const end_ns = monotonicNowNs();
+    const prefill_ms = elapsedMs(metrics.request_start_ns, prefill_done_ns);
+    const setup_ms = elapsedMs(prefill_done_ns, metrics.decode_start_ns);
+    const decode_ms = elapsedMs(metrics.decode_start_ns, end_ns);
+    const ttft_ms = if (metrics.first_emit_ns) |first| elapsedMs(metrics.request_start_ns, first) else 0;
+    const emit_span_ms = if (metrics.first_emit_ns) |first| if (metrics.last_emit_ns) |last| elapsedMs(first, last) else 0 else 0;
+    const itl_ms = if (generated_tokens > 1) emit_span_ms / @as(f64, @floatFromInt(generated_tokens - 1)) else 0;
+    const tok_s = if (decode_ms > 0) @as(f64, @floatFromInt(generated_tokens)) * 1000.0 / decode_ms else 0;
+    const emit_tok_s = if (emit_span_ms > 0 and generated_tokens > 1) @as(f64, @floatFromInt(generated_tokens - 1)) * 1000.0 / emit_span_ms else 0;
+    const tokens_per_step = if (metrics.decode_steps > 0) @as(f64, @floatFromInt(generated_tokens)) / @as(f64, @floatFromInt(metrics.decode_steps)) else @as(f64, @floatFromInt(generated_tokens));
+    const acceptance = if (metrics.attempted > 0) @as(f64, @floatFromInt(metrics.accepted)) / @as(f64, @floatFromInt(metrics.attempted)) else 0;
+    return .{
+        .prefill_ms = prefill_ms,
+        .setup_ms = setup_ms,
+        .ttft_ms = ttft_ms,
+        .decode_ms = decode_ms,
+        .tok_s = tok_s,
+        .itl_ms = itl_ms,
+        .emit_tok_s = emit_tok_s,
+        .decode_steps = @intCast(metrics.decode_steps),
+        .tokens_per_step = tokens_per_step,
+        .accepted = @intCast(metrics.accepted),
+        .attempted = @intCast(metrics.attempted),
+        .acceptance = acceptance,
+    };
+}
+
+/// Populate `mreq` with decode timing/throughput/MTP values, capture a
+/// prefix-cache occupancy snapshot (safe: the decode lock is still held),
+/// and append the record as successful. Sets `*finished = true` so the
+/// caller's errdefer does not double-record.
+fn finishMetricsRequest(
+    ctx: *Context,
+    mreq: *metrics_mod.Request,
+    mode: metrics_mod.DecodeMode,
+    decode_metrics: *const decode_loop.Metrics,
+    prefill_done_ns: u64,
+    generated: usize,
+    drafter_seed_ms: ?f64,
+    finished: *bool,
+) void {
+    const v = computeDecodeMetricValues(decode_metrics, generated, prefill_done_ns);
+    mreq.setMode(mode);
+    mreq.setDecodeMetrics(
+        v.prefill_ms,
+        v.setup_ms,
+        v.ttft_ms,
+        v.decode_ms,
+        v.tok_s,
+        v.itl_ms,
+        v.emit_tok_s,
+        v.decode_steps,
+        v.tokens_per_step,
+        v.accepted,
+        v.attempted,
+        v.acceptance,
+        drafter_seed_ms,
+        @intCast(generated),
+    );
+    // Snapshot cache occupancy while the decode lock is still held.
+    const cs = ctx.prefix_cache.stats();
+    mreq.setCacheSnapshot(.{
+        .cached_tokens = @intCast(ctx.prefix_cache.activeTokenCount()),
+        .max_cache_tokens = @intCast(cs.max_tokens),
+        .resident_entries = @intCast(cs.entry_count),
+        .reserved_tokens = @intCast(cs.reserved_tokens),
+        .resident_tokens = @intCast(ctx.prefix_cache.resident_tokens),
+        .pinned_entries = @intCast(ctx.prefix_cache.pinnedEntryCount()),
+        .cached_logits = ctx.prefix_cache.activeCachedNextTokenValid(),
+        .evictions_total = cs.evictions,
+    });
+    mreq.finish();
+    finished.* = true;
 }
 
 fn logDecodeMetrics(
@@ -886,6 +1160,7 @@ fn logDecodeMetrics(
     max_new_tokens: usize,
     generated_tokens: usize,
     prefill_done_ns: u64,
+    cache_stats: ?prefix_state_cache.Cache.Stats,
 ) void {
     const end_ns = monotonicNowNs();
     const prefill_ms = elapsedMs(metrics.request_start_ns, prefill_done_ns);
@@ -898,6 +1173,12 @@ fn logDecodeMetrics(
     const emit_tok_s = if (emit_span_ms > 0 and generated_tokens > 1) @as(f64, @floatFromInt(generated_tokens - 1)) * 1000.0 / emit_span_ms else 0;
     const tokens_per_step = if (metrics.decode_steps > 0) @as(f64, @floatFromInt(generated_tokens)) / @as(f64, @floatFromInt(metrics.decode_steps)) else @as(f64, @floatFromInt(generated_tokens));
     const acceptance = if (metrics.attempted > 0) @as(f64, @floatFromInt(metrics.accepted)) / @as(f64, @floatFromInt(metrics.attempted)) else 0;
+    // Cumulative prefix-cache token hit ratio: what fraction of all prompt
+    // tokens (this process) were served from the cache vs computed fresh.
+    const cache_hit_ratio = if (cache_stats) |cs| blk: {
+        const served = cs.hit_tokens + cs.computed_tokens;
+        break :blk if (served > 0) @as(f64, @floatFromInt(cs.hit_tokens)) / @as(f64, @floatFromInt(served)) else 0;
+    } else 0;
     log.info(
         "trace: decode metrics mode={s} prompt_tokens={d} max_new_tokens={d} generated_tokens={d} prefill_ms={d:.3} setup_ms={d:.3} ttft_ms={d:.3} decode_ms={d:.3} tok_s={d:.3} itl_ms={d:.3} emit_tok_s={d:.3} decode_steps={d} tokens_per_step={d:.3} accepted={d} attempted={d} acceptance={d:.3}",
         .{
@@ -919,11 +1200,31 @@ fn logDecodeMetrics(
             acceptance,
         },
     );
+    if (cache_stats) |cs| {
+        log.info(
+            "trace: prefix cache stats hits={d} misses={d} hit_tokens={d} computed_tokens={d} token_hit_ratio={d:.3} entries={d} reserved_tokens={d}/{d} evictions={d}",
+            .{ cs.hits, cs.misses, cs.hit_tokens, cs.computed_tokens, cache_hit_ratio, cs.entry_count, cs.reserved_tokens, cs.max_tokens, cs.evictions },
+        );
+    }
 }
 
 fn elapsedMs(start_ns: u64, end_ns: u64) f64 {
     if (start_ns == 0 or end_ns <= start_ns) return 0;
     return msFromNs(end_ns - start_ns);
+}
+
+/// Map generation-path errors to metrics error categories. Validation-style
+/// errors (bad input) are distinguished from generation/runtime errors so the
+/// dashboard can separate "user sent a bad request" from "the engine broke".
+fn metricsErrorKind(e: anyerror) metrics_mod.ErrorKind {
+    return switch (e) {
+        error.EmptyPrompt, error.EmptyInput, error.SequenceTooLong, error.InvalidServerOptions => .validation,
+        // Transport-level disconnects during streaming are not generation
+        // failures — the model/runtime did not break, the client went away.
+        error.BrokenPipe, error.ConnectionResetByPeer, error.EndOfStream => .client_disconnect,
+        // Everything else reaching this point is a generation/runtime failure.
+        else => .generation,
+    };
 }
 
 /// Seed the MTP drafter's state from the target's normalized prompt hidden

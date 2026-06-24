@@ -23,6 +23,8 @@ Defaults:
                      (up to 2 tokens/verifier pass: 1 drafted + 1 bonus); disable
                      with --no-mtp. Adds ~192 MiB prefix-cache hidden buffer
                      (prefix-cache-tokens * 4096 * 2 bytes, bounded).
+  dashboard:         http://HOST:PORT/dashboard (metrics charts + request table)
+                     polling /v1/metrics and /v1/metrics/history
   repo:              $PEREGRINE_QWEN35_REPO, newest HF cache snapshot, or /tmp/qwen3.5-9b-q4
   mtp repo:          $PEREGRINE_QWEN35_MTP_REPO, newest HF cache snapshot, or /tmp/qwen3.5-9b-mtp-q4
   build:             zig build -Doptimize=ReleaseFast
@@ -299,6 +301,7 @@ main() {
   else
     printf 'peregrine: MTP speculative decode disabled (greedy decode)\n' >&2
   fi
+  printf 'peregrine: dashboard at http://%s:%d/dashboard\n' "$host" "$port" >&2
 
   if [[ "$auto_prewarm" == "1" && -z "$prewarm_prompt_file" && -z "$prewarm_request_file" ]]; then
     if [[ -n "${PEREGRINE_PI_PREWARM_REQUEST:-}" ]]; then

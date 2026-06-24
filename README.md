@@ -126,6 +126,14 @@ POST /v1/chat/completions
 POST /v1/prefix/warmup
 ```
 
+Metrics and dashboard:
+
+```text
+GET  /dashboard
+GET  /v1/metrics
+GET  /v1/metrics/history
+```
+
 `/v1/chat/completions` accepts omitted `model`, `qwen3.5-9b-4bit`,
 `qwen3.5-9b-q4`, and `mlx-community/Qwen3.5-9B-4bit`. Other model ids are
 rejected. It supports streaming SSE, non-streaming JSON, OpenAI text content
@@ -140,6 +148,29 @@ Supported output-token aliases are `max_new_tokens`, `max_tokens`,
 `response_format` is still accepted for text-only compatibility:
 `json_object` and `json_schema` add a Qwen system instruction, and non-streaming
 responses are post-validated after generation.
+
+## Metrics Dashboard
+
+Peregrine ships an embedded, dependency-free metrics dashboard at
+`GET /dashboard`. Open `http://127.0.0.1:8080/dashboard` in a browser while the
+server is running. The page polls two JSON endpoints every second and renders
+summary cards, sparkline charts, and a recent-request table — no external
+assets, no npm build, no CDN.
+
+`GET /v1/metrics` returns a cumulative snapshot: request totals, token totals
+(prompt/generated/reuse/computed), recent averages (TTFT, decode tok/s, prefix
+hit ratio, MTP acceptance, tokens/step), and a live prefix-cache occupancy
+snapshot. When the decode lock is busy, live cache fields are `null` and
+`busy: true`.
+
+`GET /v1/metrics/history` returns the last 256 completed request records
+(oldest-first) with per-request timings, throughput, MTP acceptance, and a
+cache-occupancy snapshot. Records store only numeric counts and timings —
+never prompts, completions, or decoded text.
+
+Structured metrics are always collected (independent of
+`PEREGRINE_TRACE_PREFILL`), so the dashboard has data even when the trace env
+var is not set. The trace logs remain a separate profiling surface.
 
 ## Pi Client Configuration
 

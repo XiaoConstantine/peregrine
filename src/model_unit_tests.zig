@@ -15,4 +15,6 @@ test {
     _ = @import("runtime/mlx_gemm.zig");
     _ = @import("server/prefix_state_cache.zig");
     _ = @import("server/prefix_persist.zig");
+    _ = @import("server/metrics.zig");
+    _ = @import("server/decode_loop.zig");
 }

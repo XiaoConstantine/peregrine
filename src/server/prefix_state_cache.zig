@@ -301,6 +301,7 @@ pub const Cache = struct {
     hits: usize = 0,
     misses: usize = 0,
     hit_tokens: usize = 0,
+    computed_tokens: usize = 0,
     evictions: usize = 0,
     /// When true, entries allocate and maintain a normalized-hidden buffer for
     /// MTP drafter seeding. Flipped on by the server once the MTP sidecar is
@@ -404,6 +405,44 @@ pub const Cache = struct {
 
     pub fn recordMiss(self: *Cache) void {
         self.misses += 1;
+    }
+
+    /// Record tokens computed fresh (not served from cache) for this request.
+    /// Paired with recordHit's hit_tokens to give a token-level cache hit
+    /// ratio: hit_tokens / (hit_tokens + computed_tokens).
+    pub fn recordComputedTokens(self: *Cache, token_count: usize) void {
+        self.computed_tokens += token_count;
+    }
+
+    /// Cumulative cache statistics for observability. `hits` counts requests
+    /// that reused a cached prefix; `hit_tokens` is the total reused token
+    /// count across those hits; `computed_tokens` is the total tokens
+    /// computed fresh (prompt_tokens - reuse_tokens summed over requests).
+    /// The token-level hit ratio hit_tokens / (hit_tokens + computed_tokens)
+    /// is the most meaningful efficiency metric: it says what fraction of
+    /// prompt tokens were served from the cache vs computed fresh.
+    pub const Stats = struct {
+        hits: usize,
+        misses: usize,
+        hit_tokens: usize,
+        computed_tokens: usize,
+        reserved_tokens: usize,
+        max_tokens: usize,
+        entry_count: usize,
+        evictions: usize,
+    };
+
+    pub fn stats(self: *const Cache) Stats {
+        return .{
+            .hits = self.hits,
+            .misses = self.misses,
+            .hit_tokens = self.hit_tokens,
+            .computed_tokens = self.computed_tokens,
+            .reserved_tokens = self.reserved_tokens,
+            .max_tokens = self.max_tokens,
+            .entry_count = self.entries.items.len,
+            .evictions = self.evictions,
+        };
     }
 
     /// Enable hidden-state tracking for subsequent stores and loads. Must be
@@ -1122,4 +1161,41 @@ test "storePrefixFromWork reads reuse validity from the shifted entry, not stale
     // Suffix rows 3..5 are 0x33.
     try std.testing.expectEqual(@as(u8, 0x33), hidden.slice(u8)[row_bytes * 3]);
     try std.testing.expectEqual(@as(u8, 0x33), hidden.slice(u8)[row_bytes * 4]);
+}
+
+test "stats tracks token-level hit ratio across hits, misses, and computed tokens" {
+    var device = try testDevice();
+    defer device.destroy();
+
+    var cache = try Cache.init(4096, 1600);
+    defer cache.deinit(std.testing.allocator);
+
+    // Miss: no entries yet, nothing reused. Caller records computed_tokens.
+    cache.recordMiss();
+    cache.recordComputedTokens(1000);
+    // Add an entry (1000 tokens) so subsequent requests can hit.
+    var work_state = try ModelState.initBf16FullCaches(&device, 1600);
+    defer work_state.deinit();
+    const prefix_a = [_]u32{1} ** 1000;
+    const match_a = try cache.startDirectEntry(std.testing.allocator, &device, &prefix_a, false);
+    try cache.finishLoadedEntry(std.testing.allocator, match_a);
+
+    // Partial hit: reuses 800 of a 1200-token prompt; 400 computed.
+    cache.recordHit(800);
+    cache.recordComputedTokens(400);
+
+    // Full hit: reuses all 1000 of a 1000-token prompt; 0 computed.
+    cache.recordHit(1000);
+    cache.recordComputedTokens(0);
+
+    const s = cache.stats();
+    try std.testing.expectEqual(@as(usize, 2), s.hits);
+    try std.testing.expectEqual(@as(usize, 1), s.misses);
+    try std.testing.expectEqual(@as(usize, 1800), s.hit_tokens); // 800 + 1000
+    try std.testing.expectEqual(@as(usize, 1400), s.computed_tokens); // 1000 + 400 + 0
+    // Token hit ratio = 1800 / (1800 + 1400) = 0.5625
+    const served = s.hit_tokens + s.computed_tokens;
+    const ratio: f64 = @as(f64, @floatFromInt(s.hit_tokens)) / @as(f64, @floatFromInt(served));
+    const expected: f64 = 0.5625;
+    try std.testing.expect(@abs(ratio - expected) < 1e-9);
 }

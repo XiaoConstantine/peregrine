@@ -22,12 +22,27 @@ pub const Metrics = struct {
     decode_steps: usize = 0,
     accepted: usize = 0,
     attempted: usize = 0,
+    /// When false, recordEmit skips the per-token monotonicNowNs() call for
+    /// last_emit_ns (itl_ms and emit_tok_s will be 0). first_emit_ns is always
+    /// captured for TTFT (one clock_gettime on the first token only). Set to
+    /// true when trace_prefill is on, so the per-token timing overhead is
+    /// avoided when tracing is off while structured metrics still get TTFT,
+    /// decode_steps, accepted, and attempted.
+    time_emits: bool = false,
 
     pub fn recordEmit(self: *Metrics, generated_tokens: usize) void {
-        const now = monotonicNowNs();
-        if (self.first_emit_ns == null) self.first_emit_ns = now;
-        self.last_emit_ns = now;
         self.emitted_tokens = generated_tokens;
+        // Always capture first_emit_ns for TTFT (one clock_gettime on the
+        // first token only). Gate last_emit_ns on time_emits to avoid
+        // per-token clock_gettime overhead when tracing is off; itl_ms and
+        // emit_tok_s will be 0 in that case, which is acceptable.
+        if (self.first_emit_ns == null) {
+            const now = monotonicNowNs();
+            self.first_emit_ns = now;
+            if (self.time_emits) self.last_emit_ns = now;
+            return;
+        }
+        if (self.time_emits) self.last_emit_ns = monotonicNowNs();
     }
 };
 
